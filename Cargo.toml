@@ -1,0 +1,32 @@
+[package]
+name = "mouse-radar-rs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+teloxide = { version = "0.17", features = ["macros", "ctrlc_handler"] }
+tokio = { version = "1", features = ["full"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
+reqwest = { version = "0.13", features = ["json", "form", "query"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+dotenvy = "0.15"
+anyhow = "1"
+async-trait = "0.1"
+log = "0.4"
+env_logger = "0.11"
+
+[dev-dependencies]
+tempfile = "3"
+wiremock = "0.6"
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+too_many_lines = "allow"
+uninlined_format_args = "allow"
+format_push_string = "allow"
