@@ -5,8 +5,8 @@ pub mod formatting;
 pub mod poller;
 pub mod strava;
 
+use log::{debug, info};
 use std::sync::Arc;
-use log::{info, debug};
 use teloxide::prelude::*;
 
 use commands::Command;
@@ -49,9 +49,9 @@ async fn main() -> anyhow::Result<()> {
                 .filter_command::<Command>()
                 .endpoint(commands::handle_command),
         )
-        .branch(Update::filter_message().endpoint(
-            |_bot: Bot, _msg: Message| async move { Ok(()) },
-        ));
+        .branch(
+            Update::filter_message().endpoint(|_bot: Bot, _msg: Message| async move { Ok(()) }),
+        );
 
     let mut dispatcher = Dispatcher::builder(bot.clone(), handler)
         .dependencies(dptree::deps![app_state])

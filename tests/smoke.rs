@@ -1,9 +1,9 @@
-use std::sync::Arc;
 use async_trait::async_trait;
+use std::sync::Arc;
 
 use mouse_radar_rs::db::{self, CachedActivity, Db};
-use mouse_radar_rs::strava::{StravaActivity, StravaApi, StravaAthleteSummary, TokenResponse};
 use mouse_radar_rs::formatting;
+use mouse_radar_rs::strava::{StravaActivity, StravaApi, StravaAthleteSummary, TokenResponse};
 
 /// Mock Strava client that returns canned data.
 struct MockStrava {
@@ -40,9 +40,8 @@ async fn test_full_pipeline_with_mock() {
     let db = Arc::new(Db::open(db_path.to_str().unwrap()).unwrap());
 
     // Insert a test athlete
-    db.run(|conn| {
-        db::insert_athlete(conn, 12345, "testuser", "acc", "ref", 9999999999)
-    }).unwrap();
+    db.run(|conn| db::insert_athlete(conn, 12345, "testuser", "acc", "ref", 9999999999))
+        .unwrap();
 
     // Create mock Strava with one activity
     let mock = Arc::new(MockStrava {
@@ -84,15 +83,15 @@ async fn test_full_pipeline_with_mock() {
     assert_eq!(cached.url, "https://www.strava.com/activities/999");
 
     // Cache it in the DB
-    db.run(|conn| {
-        db::cache_activity(conn, &cached)
-    }).unwrap();
+    db.run(|conn| db::cache_activity(conn, &cached)).unwrap();
 
     // Verify stats (activity date is 2026-05-14)
     let monday = chrono::NaiveDate::from_ymd_opt(2026, 5, 11).unwrap();
     let first_of_month = chrono::NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
     let week = db.run(|conn| db::get_week_km(conn, 12345, monday)).unwrap();
-    let month = db.run(|conn| db::get_month_km(conn, 12345, first_of_month)).unwrap();
+    let month = db
+        .run(|conn| db::get_month_km(conn, 12345, first_of_month))
+        .unwrap();
 
     assert_eq!(week, 5.0);
     assert_eq!(month, 5.0);
@@ -127,14 +126,22 @@ fn test_cache_survives_reopen() {
         let db = Db::open(db_path.to_str().unwrap()).unwrap();
         db.run(|conn| {
             db::insert_athlete(conn, 1, "alice", "a", "r", 0).unwrap();
-            db::cache_activity(conn, &CachedActivity {
-                activity_id: 1, athlete_id: 1, title: "Run".into(),
-                activity_type: "Run".into(), distance_km: 8.0,
-                duration_s: 2400, pace_sec_per_km: Some(300),
-                start_date_local: "2026-05-14T08:00:00Z".into(),
-                url: "https://strava.com/activities/1".into(),
-            })
-        }).unwrap();
+            db::cache_activity(
+                conn,
+                &CachedActivity {
+                    activity_id: 1,
+                    athlete_id: 1,
+                    title: "Run".into(),
+                    activity_type: "Run".into(),
+                    distance_km: 8.0,
+                    duration_s: 2400,
+                    pace_sec_per_km: Some(300),
+                    start_date_local: "2026-05-14T08:00:00Z".into(),
+                    url: "https://strava.com/activities/1".into(),
+                },
+            )
+        })
+        .unwrap();
     }
 
     // Second session (reopen)
@@ -143,7 +150,10 @@ fn test_cache_survives_reopen() {
         let monday = chrono::NaiveDate::from_ymd_opt(2026, 5, 11).unwrap();
         let km = db.run(|conn| db::get_week_km(conn, 1, monday)).unwrap();
         assert_eq!(km, 8.0);
-        let latest = db.run(|conn| db::get_latest_activity(conn, 1)).unwrap().unwrap();
+        let latest = db
+            .run(|conn| db::get_latest_activity(conn, 1))
+            .unwrap()
+            .unwrap();
         assert_eq!(latest.title, "Run");
     }
 }

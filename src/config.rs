@@ -22,8 +22,7 @@ impl Config {
             strava_client_secret: env::var("STRAVA_CLIENT_SECRET")?,
             poll_interval_seconds: parse_env_default("POLL_INTERVAL_SECONDS", 300),
             cold_start_lookback_days: parse_env_default("COLD_START_LOOKBACK_DAYS", 30),
-            database_path: env::var("DATABASE_PATH")
-                .unwrap_or_else(|_| "./data/bot.db".into()),
+            database_path: env::var("DATABASE_PATH").unwrap_or_else(|_| "./data/bot.db".into()),
             bot_admin_usernames: env::var("BOT_ADMIN_USERNAMES")
                 .unwrap_or_default()
                 .split(',')

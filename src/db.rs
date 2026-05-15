@@ -1,8 +1,8 @@
-use std::path::Path;
-use std::sync::Mutex;
-use rusqlite::Connection;
 use anyhow::Result;
 use chrono::{Datelike, Local, NaiveDate};
+use rusqlite::Connection;
+use std::path::Path;
+use std::sync::Mutex;
 
 pub struct Db {
     conn: Mutex<Connection>,
@@ -16,10 +16,12 @@ impl Db {
         let conn = Connection::open(path)?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
-             PRAGMA foreign_keys=ON;"
+             PRAGMA foreign_keys=ON;",
         )?;
         init_schema(&conn)?;
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     /// Run a closure with the connection, blocks on the mutex.
@@ -58,7 +60,7 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             start_date_local TEXT,     -- ISO 8601 datetime in athlete's local timezone
             url             TEXT,
             cached_at       INTEGER NOT NULL DEFAULT (unixepoch())
-        );"
+        );",
     )?;
     Ok(())
 }
@@ -92,7 +94,7 @@ pub fn insert_athlete(
 pub fn get_athlete(conn: &Connection, strava_id: i64) -> Result<Option<Athlete>> {
     let mut stmt = conn.prepare(
         "SELECT strava_id, name, access_token, refresh_token, token_expires, added_at
-         FROM athletes WHERE strava_id = ?1"
+         FROM athletes WHERE strava_id = ?1",
     )?;
     let mut rows = stmt.query_map(rusqlite::params![strava_id], |row| {
         Ok(Athlete {
@@ -113,7 +115,7 @@ pub fn get_athlete(conn: &Connection, strava_id: i64) -> Result<Option<Athlete>>
 pub fn list_athletes(conn: &Connection) -> Result<Vec<Athlete>> {
     let mut stmt = conn.prepare(
         "SELECT strava_id, name, access_token, refresh_token, token_expires, added_at
-         FROM athletes ORDER BY added_at"
+         FROM athletes ORDER BY added_at",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok(Athlete {
@@ -147,9 +149,7 @@ pub fn update_athlete_tokens(
 // --- Seen activities ---
 
 pub fn is_activity_seen(conn: &Connection, activity_id: i64) -> Result<bool> {
-    let mut stmt = conn.prepare(
-        "SELECT COUNT(*) FROM seen_activities WHERE activity_id = ?1"
-    )?;
+    let mut stmt = conn.prepare("SELECT COUNT(*) FROM seen_activities WHERE activity_id = ?1")?;
     let count: i64 = stmt.query_row(rusqlite::params![activity_id], |row| row.get(0))?;
     Ok(count > 0)
 }
@@ -164,7 +164,7 @@ pub fn mark_activity_seen(conn: &Connection, activity_id: i64, athlete_id: i64) 
 
 pub fn bulk_mark_seen(conn: &Connection, items: &[(i64, i64)]) -> Result<()> {
     let mut stmt = conn.prepare(
-        "INSERT OR IGNORE INTO seen_activities (activity_id, athlete_id) VALUES (?1, ?2)"
+        "INSERT OR IGNORE INTO seen_activities (activity_id, athlete_id) VALUES (?1, ?2)",
     )?;
     for (activity_id, athlete_id) in items {
         stmt.execute(rusqlite::params![activity_id, athlete_id])?;
@@ -213,12 +213,19 @@ pub fn bulk_cache_activities(conn: &Connection, activities: &[CachedActivity]) -
         "INSERT OR REPLACE INTO activity_cache
          (activity_id, athlete_id, title, activity_type, distance_km, duration_s,
           pace_sec_per_km, start_date_local, url)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
     )?;
     for a in activities {
         stmt.execute(rusqlite::params![
-            a.activity_id, a.athlete_id, a.title, a.activity_type,
-            a.distance_km, a.duration_s, a.pace_sec_per_km, a.start_date_local, a.url,
+            a.activity_id,
+            a.athlete_id,
+            a.title,
+            a.activity_type,
+            a.distance_km,
+            a.duration_s,
+            a.pace_sec_per_km,
+            a.start_date_local,
+            a.url,
         ])?;
     }
     Ok(())
@@ -228,11 +235,9 @@ pub fn bulk_cache_activities(conn: &Connection, activities: &[CachedActivity]) -
 #[must_use]
 pub fn period_boundaries() -> (NaiveDate, NaiveDate) {
     let today = Local::now().date_naive();
-    let monday = today - chrono::Duration::days(
-        i64::from(today.weekday().num_days_from_monday())
-    );
-    let first_of_month = NaiveDate::from_ymd_opt(today.year(), today.month(), 1)
-        .expect("valid date");
+    let monday = today - chrono::Duration::days(i64::from(today.weekday().num_days_from_monday()));
+    let first_of_month =
+        NaiveDate::from_ymd_opt(today.year(), today.month(), 1).expect("valid date");
     (monday, first_of_month)
 }
 
@@ -257,7 +262,8 @@ pub fn get_month_km(conn: &Connection, athlete_id: i64, first_of_month: NaiveDat
         NaiveDate::from_ymd_opt(first_of_month.year() + 1, 1, 1)
     } else {
         NaiveDate::from_ymd_opt(first_of_month.year(), first_of_month.month() + 1, 1)
-    }.expect("valid date");
+    }
+    .expect("valid date");
     let next_str = next_month.format("%Y-%m-%d").to_string();
     let total: f64 = conn.query_row(
         "SELECT COALESCE(SUM(distance_km), 0.0) FROM activity_cache
@@ -276,9 +282,9 @@ pub fn get_oldest_activity_date(conn: &Connection, athlete_id: i64) -> Result<Op
         rusqlite::params![athlete_id],
         |row| row.get(0),
     )?;
-    Ok(text.as_deref().and_then(|s| {
-        NaiveDate::parse_from_str(&s[..10], "%Y-%m-%d").ok()
-    }))
+    Ok(text
+        .as_deref()
+        .and_then(|s| NaiveDate::parse_from_str(&s[..10], "%Y-%m-%d").ok()))
 }
 
 pub fn get_latest_activity(conn: &Connection, athlete_id: i64) -> Result<Option<CachedActivity>> {
@@ -288,7 +294,7 @@ pub fn get_latest_activity(conn: &Connection, athlete_id: i64) -> Result<Option<
          FROM activity_cache
          WHERE athlete_id = ?1
          ORDER BY start_date_local DESC, activity_id DESC
-         LIMIT 1"
+         LIMIT 1",
     )?;
     let mut rows = stmt.query_map(rusqlite::params![athlete_id], |row| {
         Ok(CachedActivity {
@@ -335,21 +341,22 @@ mod tests {
         let db = Db::open(db_path.to_str().unwrap()).unwrap();
 
         db.run(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
-            ).unwrap();
+            let mut stmt = conn
+                .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+                .unwrap();
             let tables: Vec<String> = stmt
-                .query_map([], |row| row.get(0)).unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
                 .filter_map(|r| r.ok())
                 .collect();
 
-            assert_eq!(tables, vec![
-                "activity_cache",
-                "athletes",
-                "seen_activities",
-            ]);
+            assert_eq!(
+                tables,
+                vec!["activity_cache", "athletes", "seen_activities",]
+            );
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
     }
 
     #[test]
@@ -366,7 +373,8 @@ mod tests {
             assert_eq!(a.refresh_token, "ref_tok");
             assert_eq!(a.token_expires, 1710000000);
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
     }
 
     #[test]
@@ -382,7 +390,8 @@ mod tests {
             assert_eq!(list[0].name, "alice");
             assert_eq!(list[1].name, "bob");
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
     }
 
     #[test]
@@ -398,7 +407,8 @@ mod tests {
             assert_eq!(a.refresh_token, "new_ref");
             assert_eq!(a.token_expires, 200);
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
     }
 
     #[test]
@@ -409,7 +419,8 @@ mod tests {
             let a = get_athlete(conn, 999).unwrap();
             assert!(a.is_none());
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
     }
 
     #[test]
@@ -423,7 +434,8 @@ mod tests {
             mark_activity_seen(conn, 100, 1).unwrap();
             assert!(is_activity_seen(conn, 100).unwrap());
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
     }
 
     #[test]
@@ -438,7 +450,8 @@ mod tests {
             assert!(is_activity_seen(conn, 102).unwrap());
             assert!(is_activity_seen(conn, 103).unwrap());
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
     }
 
     #[test]
@@ -465,7 +478,8 @@ mod tests {
             assert_eq!(latest.title, "Morning Run");
             assert_eq!(latest.distance_km, 10.5);
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
     }
 
     #[test]
@@ -479,18 +493,36 @@ mod tests {
             let date1 = "2026-05-14T08:00:00"; // Thursday
             let date2 = "2026-05-15T16:00:00"; // Friday same week
 
-            cache_activity(conn, &CachedActivity {
-                activity_id: 1, athlete_id: 1, title: "R1".into(),
-                activity_type: "Run".into(), distance_km: 5.0, duration_s: 1800,
-                pace_sec_per_km: None, start_date_local: date1.into(),
-                url: "".into(),
-            }).unwrap();
-            cache_activity(conn, &CachedActivity {
-                activity_id: 2, athlete_id: 1, title: "R2".into(),
-                activity_type: "Run".into(), distance_km: 7.5, duration_s: 2700,
-                pace_sec_per_km: None, start_date_local: date2.into(),
-                url: "".into(),
-            }).unwrap();
+            cache_activity(
+                conn,
+                &CachedActivity {
+                    activity_id: 1,
+                    athlete_id: 1,
+                    title: "R1".into(),
+                    activity_type: "Run".into(),
+                    distance_km: 5.0,
+                    duration_s: 1800,
+                    pace_sec_per_km: None,
+                    start_date_local: date1.into(),
+                    url: "".into(),
+                },
+            )
+            .unwrap();
+            cache_activity(
+                conn,
+                &CachedActivity {
+                    activity_id: 2,
+                    athlete_id: 1,
+                    title: "R2".into(),
+                    activity_type: "Run".into(),
+                    distance_km: 7.5,
+                    duration_s: 2700,
+                    pace_sec_per_km: None,
+                    start_date_local: date2.into(),
+                    url: "".into(),
+                },
+            )
+            .unwrap();
 
             // Monday of that week is 2026-05-11
             let monday = NaiveDate::from_ymd_opt(2026, 5, 11).unwrap();
@@ -502,10 +534,12 @@ mod tests {
             assert_eq!(month, 12.5);
 
             // Activity before Monday should not be counted
-            let week_before = get_week_km(conn, 1, NaiveDate::from_ymd_opt(2026, 5, 18).unwrap()).unwrap();
+            let week_before =
+                get_week_km(conn, 1, NaiveDate::from_ymd_opt(2026, 5, 18).unwrap()).unwrap();
             assert_eq!(week_before, 0.0);
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
     }
 
     #[test]
@@ -515,13 +549,21 @@ mod tests {
         db.run(|conn| {
             insert_athlete(conn, 1, "alice", "a", "r", 0).unwrap();
 
-            cache_activity(conn, &CachedActivity {
-                activity_id: 1, athlete_id: 1, title: "Sun Night".into(),
-                activity_type: "Run".into(), distance_km: 5.0, duration_s: 1800,
-                pace_sec_per_km: None,
-                start_date_local: "2026-05-10T23:00:00".into(), // Sunday
-                url: "".into(),
-            }).unwrap();
+            cache_activity(
+                conn,
+                &CachedActivity {
+                    activity_id: 1,
+                    athlete_id: 1,
+                    title: "Sun Night".into(),
+                    activity_type: "Run".into(),
+                    distance_km: 5.0,
+                    duration_s: 1800,
+                    pace_sec_per_km: None,
+                    start_date_local: "2026-05-10T23:00:00".into(), // Sunday
+                    url: "".into(),
+                },
+            )
+            .unwrap();
 
             // Monday of that week (May 4) includes Sunday May 10
             let monday = NaiveDate::from_ymd_opt(2026, 5, 4).unwrap();
@@ -531,7 +573,8 @@ mod tests {
             let next_monday = NaiveDate::from_ymd_opt(2026, 5, 11).unwrap();
             assert_eq!(get_week_km(conn, 1, next_monday).unwrap(), 0.0);
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
     }
 
     #[test]
@@ -541,13 +584,21 @@ mod tests {
         db.run(|conn| {
             insert_athlete(conn, 1, "alice", "a", "r", 0).unwrap();
 
-            cache_activity(conn, &CachedActivity {
-                activity_id: 1, athlete_id: 1, title: "Mon Morning".into(),
-                activity_type: "Run".into(), distance_km: 5.0, duration_s: 1800,
-                pace_sec_per_km: None,
-                start_date_local: "2026-05-11T00:01:00".into(), // Monday
-                url: "".into(),
-            }).unwrap();
+            cache_activity(
+                conn,
+                &CachedActivity {
+                    activity_id: 1,
+                    athlete_id: 1,
+                    title: "Mon Morning".into(),
+                    activity_type: "Run".into(),
+                    distance_km: 5.0,
+                    duration_s: 1800,
+                    pace_sec_per_km: None,
+                    start_date_local: "2026-05-11T00:01:00".into(), // Monday
+                    url: "".into(),
+                },
+            )
+            .unwrap();
 
             // Should be in the week starting May 11
             let monday = NaiveDate::from_ymd_opt(2026, 5, 11).unwrap();
@@ -557,7 +608,8 @@ mod tests {
             let prev_monday = NaiveDate::from_ymd_opt(2026, 5, 4).unwrap();
             assert_eq!(get_week_km(conn, 1, prev_monday).unwrap(), 0.0);
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
     }
 
     #[test]
@@ -567,20 +619,36 @@ mod tests {
         db.run(|conn| {
             insert_athlete(conn, 1, "alice", "a", "r", 0).unwrap();
 
-            cache_activity(conn, &CachedActivity {
-                activity_id: 1, athlete_id: 1, title: "May Run".into(),
-                activity_type: "Run".into(), distance_km: 10.0, duration_s: 3600,
-                pace_sec_per_km: None,
-                start_date_local: "2026-05-31T22:00:00".into(),
-                url: "".into(),
-            }).unwrap();
-            cache_activity(conn, &CachedActivity {
-                activity_id: 2, athlete_id: 1, title: "Jun Run".into(),
-                activity_type: "Run".into(), distance_km: 3.0, duration_s: 900,
-                pace_sec_per_km: None,
-                start_date_local: "2026-06-01T06:00:00".into(),
-                url: "".into(),
-            }).unwrap();
+            cache_activity(
+                conn,
+                &CachedActivity {
+                    activity_id: 1,
+                    athlete_id: 1,
+                    title: "May Run".into(),
+                    activity_type: "Run".into(),
+                    distance_km: 10.0,
+                    duration_s: 3600,
+                    pace_sec_per_km: None,
+                    start_date_local: "2026-05-31T22:00:00".into(),
+                    url: "".into(),
+                },
+            )
+            .unwrap();
+            cache_activity(
+                conn,
+                &CachedActivity {
+                    activity_id: 2,
+                    athlete_id: 1,
+                    title: "Jun Run".into(),
+                    activity_type: "Run".into(),
+                    distance_km: 3.0,
+                    duration_s: 900,
+                    pace_sec_per_km: None,
+                    start_date_local: "2026-06-01T06:00:00".into(),
+                    url: "".into(),
+                },
+            )
+            .unwrap();
 
             // May total
             let may_1 = NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
@@ -590,7 +658,8 @@ mod tests {
             let jun_1 = NaiveDate::from_ymd_opt(2026, 6, 1).unwrap();
             assert_eq!(get_month_km(conn, 1, jun_1).unwrap(), 3.0);
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
     }
 
     #[test]
@@ -601,13 +670,26 @@ mod tests {
             insert_athlete(conn, 1, "alice", "a", "r", 0).unwrap();
 
             // Same date, different times — should all be included
-            for (time_str, activity_id_val) in [("2026-05-14T00:00:01", 1_i64), ("2026-05-14T12:00:00", 2), ("2026-05-14T23:59:59", 3)] {
-                cache_activity(conn, &CachedActivity {
-                    activity_id: activity_id_val, athlete_id: 1, title: "Run".into(),
-                    activity_type: "Run".into(), distance_km: 2.0, duration_s: 600,
-                    pace_sec_per_km: None, start_date_local: time_str.into(),
-                    url: "".into(),
-                }).unwrap();
+            for (time_str, activity_id_val) in [
+                ("2026-05-14T00:00:01", 1_i64),
+                ("2026-05-14T12:00:00", 2),
+                ("2026-05-14T23:59:59", 3),
+            ] {
+                cache_activity(
+                    conn,
+                    &CachedActivity {
+                        activity_id: activity_id_val,
+                        athlete_id: 1,
+                        title: "Run".into(),
+                        activity_type: "Run".into(),
+                        distance_km: 2.0,
+                        duration_s: 600,
+                        pace_sec_per_km: None,
+                        start_date_local: time_str.into(),
+                        url: "".into(),
+                    },
+                )
+                .unwrap();
             }
 
             // All three count for the week containing May 14
@@ -615,17 +697,26 @@ mod tests {
             assert_eq!(get_week_km(conn, 1, monday).unwrap(), 6.0);
 
             // Previous day (May 13, 11:59pm) does NOT count for week starting May 11
-            cache_activity(conn, &CachedActivity {
-                activity_id: 0, athlete_id: 1, title: "Late".into(),
-                activity_type: "Run".into(), distance_km: 1.0, duration_s: 300,
-                pace_sec_per_km: None,
-                start_date_local: "2026-05-10T23:59:00".into(),
-                url: "".into(),
-            }).unwrap();
+            cache_activity(
+                conn,
+                &CachedActivity {
+                    activity_id: 0,
+                    athlete_id: 1,
+                    title: "Late".into(),
+                    activity_type: "Run".into(),
+                    distance_km: 1.0,
+                    duration_s: 300,
+                    pace_sec_per_km: None,
+                    start_date_local: "2026-05-10T23:59:00".into(),
+                    url: "".into(),
+                },
+            )
+            .unwrap();
             // This is in the previous week (Mon May 4), not this week (Mon May 11)
             assert_eq!(get_week_km(conn, 1, monday).unwrap(), 6.0);
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
     }
 
     #[test]
@@ -638,18 +729,36 @@ mod tests {
             assert!(get_last_activity_date(conn, 1).unwrap().is_none());
             assert!(get_oldest_activity_date(conn, 1).unwrap().is_none());
 
-            cache_activity(conn, &CachedActivity {
-                activity_id: 1, athlete_id: 1, title: "Old".into(),
-                activity_type: "Run".into(), distance_km: 5.0, duration_s: 1800,
-                pace_sec_per_km: None, start_date_local: "2024-01-01T00:00:00Z".into(),
-                url: "".into(),
-            }).unwrap();
-            cache_activity(conn, &CachedActivity {
-                activity_id: 2, athlete_id: 1, title: "New".into(),
-                activity_type: "Run".into(), distance_km: 5.0, duration_s: 1800,
-                pace_sec_per_km: None, start_date_local: "2024-01-15T00:00:00Z".into(),
-                url: "".into(),
-            }).unwrap();
+            cache_activity(
+                conn,
+                &CachedActivity {
+                    activity_id: 1,
+                    athlete_id: 1,
+                    title: "Old".into(),
+                    activity_type: "Run".into(),
+                    distance_km: 5.0,
+                    duration_s: 1800,
+                    pace_sec_per_km: None,
+                    start_date_local: "2024-01-01T00:00:00Z".into(),
+                    url: "".into(),
+                },
+            )
+            .unwrap();
+            cache_activity(
+                conn,
+                &CachedActivity {
+                    activity_id: 2,
+                    athlete_id: 1,
+                    title: "New".into(),
+                    activity_type: "Run".into(),
+                    distance_km: 5.0,
+                    duration_s: 1800,
+                    pace_sec_per_km: None,
+                    start_date_local: "2024-01-15T00:00:00Z".into(),
+                    url: "".into(),
+                },
+            )
+            .unwrap();
 
             assert_eq!(
                 get_last_activity_date(conn, 1).unwrap().unwrap(),
@@ -660,7 +769,8 @@ mod tests {
                 NaiveDate::from_ymd_opt(2024, 1, 1).unwrap()
             );
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
     }
 
     #[test]
@@ -672,22 +782,39 @@ mod tests {
 
             let today = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
-            bulk_cache_activities(conn, &[
-                CachedActivity {
-                    activity_id: 1, athlete_id: 1, title: "A".into(),
-                    activity_type: "Run".into(), distance_km: 1.0, duration_s: 100,
-                    pace_sec_per_km: None, start_date_local: today.clone(), url: "".into(),
-                },
-                CachedActivity {
-                    activity_id: 2, athlete_id: 1, title: "B".into(),
-                    activity_type: "Run".into(), distance_km: 2.0, duration_s: 200,
-                    pace_sec_per_km: None, start_date_local: today.clone(), url: "".into(),
-                },
-            ]).unwrap();
+            bulk_cache_activities(
+                conn,
+                &[
+                    CachedActivity {
+                        activity_id: 1,
+                        athlete_id: 1,
+                        title: "A".into(),
+                        activity_type: "Run".into(),
+                        distance_km: 1.0,
+                        duration_s: 100,
+                        pace_sec_per_km: None,
+                        start_date_local: today.clone(),
+                        url: "".into(),
+                    },
+                    CachedActivity {
+                        activity_id: 2,
+                        athlete_id: 1,
+                        title: "B".into(),
+                        activity_type: "Run".into(),
+                        distance_km: 2.0,
+                        duration_s: 200,
+                        pace_sec_per_km: None,
+                        start_date_local: today.clone(),
+                        url: "".into(),
+                    },
+                ],
+            )
+            .unwrap();
 
             let a = get_latest_activity(conn, 1).unwrap().unwrap();
             assert_eq!(a.activity_id, 2); // latest by start_date (ties: higher id)
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
     }
 }

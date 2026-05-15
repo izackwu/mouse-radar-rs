@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use log::info;
+use std::sync::Arc;
 use teloxide::{prelude::*, utils::command::BotCommands, RequestError};
 
 use crate::config::Config;
@@ -8,9 +8,7 @@ use crate::strava::TokenResponse;
 
 /// Convert a displayable error into a `RequestError` (for use in ? propagation).
 fn to_request_error(e: impl std::fmt::Display) -> RequestError {
-    RequestError::Io(std::sync::Arc::new(std::io::Error::other(
-        e.to_string(),
-    )))
+    RequestError::Io(std::sync::Arc::new(std::io::Error::other(e.to_string())))
 }
 
 #[derive(BotCommands, Clone)]
@@ -132,7 +130,9 @@ async fn cmd_strava(
     let result = tokio::task::spawn_blocking(move || {
         db.run(|conn| {
             let athletes = db::list_athletes(conn)?;
-            let athlete = athletes.iter().find(|a| a.name.eq_ignore_ascii_case(&name_clone));
+            let athlete = athletes
+                .iter()
+                .find(|a| a.name.eq_ignore_ascii_case(&name_clone));
 
             let Some(athlete) = athlete else {
                 return Ok(format!("Athlete '{}' not found.", name_clone));
@@ -144,8 +144,7 @@ async fn cmd_strava(
             let month = db::get_month_km(conn, athlete.strava_id, first_of_month)?;
             let oldest = db::get_oldest_activity_date(conn, athlete.strava_id)?;
 
-            let (inc_week, inc_month) =
-                crate::formatting::incomplete_periods(oldest);
+            let (inc_week, inc_month) = crate::formatting::incomplete_periods(oldest);
 
             let mut text = format!(
                 "{} — Week: {:.1} km · Month: {:.1} km",
@@ -265,7 +264,8 @@ async fn cmd_auth(
             return Ok(());
         }
         Err(e) => {
-            bot.send_message(msg.chat.id, format!("Request error: {}", e)).await?;
+            bot.send_message(msg.chat.id, format!("Request error: {}", e))
+                .await?;
             return Ok(());
         }
     };
@@ -278,9 +278,7 @@ async fn cmd_auth(
     let exp = token.expires_at;
 
     tokio::task::spawn_blocking(move || {
-        db.run(|conn| {
-            db::insert_athlete(conn, strava_id_int, &n, &acc, &refr, exp)
-        })
+        db.run(|conn| db::insert_athlete(conn, strava_id_int, &n, &acc, &refr, exp))
     })
     .await
     .map_err(|e| {
@@ -301,7 +299,9 @@ async fn cmd_auth(
     info!("Athlete {} ({}) authorized", name, strava_id_int);
 
     // Notify the poller to cold-start this athlete immediately
-    let _ = state.poll_tx.send(crate::poller::PollCommand::ColdStart(strava_id_int));
+    let _ = state
+        .poll_tx
+        .send(crate::poller::PollCommand::ColdStart(strava_id_int));
 
     Ok(())
 }

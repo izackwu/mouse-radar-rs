@@ -1,15 +1,15 @@
-use std::sync::Arc;
-use std::time::Duration;
 use anyhow::Result;
 use chrono::Utc;
-use log::{info, warn, error};
+use log::{error, info, warn};
+use std::sync::Arc;
+use std::time::Duration;
 use teloxide::prelude::*;
 
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::config::Config;
 use crate::db::{self, CachedActivity, Db};
-use crate::strava::{StravaApi, to_cached};
+use crate::strava::{to_cached, StravaApi};
 
 pub enum PollCommand {
     PollAll,
@@ -26,8 +26,7 @@ pub async fn run_poll_cycle(
     let chat_id: ChatId = ChatId(config.telegram_chat_id.parse()?);
     let athletes = {
         let db = Arc::clone(db);
-        tokio::task::spawn_blocking(move || db.run(db::list_athletes))
-            .await??
+        tokio::task::spawn_blocking(move || db.run(db::list_athletes)).await??
     };
 
     if athletes.is_empty() {
@@ -39,9 +38,10 @@ pub async fn run_poll_cycle(
 
     for athlete in &athletes {
         if let Err(e) = process_athlete(
-            config, db, strava, bot, &chat_id, athlete,
-            &tracked, lookback,
-        ).await {
+            config, db, strava, bot, &chat_id, athlete, &tracked, lookback,
+        )
+        .await
+        {
             error!(
                 "Error processing athlete {} ({}): {}",
                 athlete.name, athlete.strava_id, e
@@ -63,9 +63,8 @@ pub async fn run_poll_loop(
     bot: Bot,
     mut rx: UnboundedReceiver<PollCommand>,
 ) {
-    let mut interval = tokio::time::interval(
-        std::time::Duration::from_secs(config.poll_interval_seconds),
-    );
+    let mut interval =
+        tokio::time::interval(std::time::Duration::from_secs(config.poll_interval_seconds));
     // Skip immediate first tick
     interval.tick().await;
 
@@ -166,7 +165,8 @@ pub async fn process_athlete(
                     db.run(|conn| {
                         db::update_athlete_tokens(conn, strava_id, &acc, &refr, token_expires)
                     })
-                }).await??;
+                })
+                .await??;
             }
             Err(e) => {
                 warn!(
@@ -183,24 +183,20 @@ pub async fn process_athlete(
     let strava_id = athlete.strava_id;
     let last_date: Option<String> = tokio::task::spawn_blocking(move || {
         db_clone.run(|conn| db::get_last_activity_date(conn, strava_id))
-    }).await??;
+    })
+    .await??;
 
     let after_epoch = last_date
         .as_ref()
         .and_then(|d| parse_iso_to_epoch(d))
-        .unwrap_or_else(|| {
-            (Utc::now() - lookback).timestamp()
-        });
+        .unwrap_or_else(|| (Utc::now() - lookback).timestamp());
 
     let is_cold_start = last_date.is_none();
 
     // 3. Fetch activities
-    let activities = strava.get_activities(
-        &access_token,
-        Some(after_epoch),
-        None,
-        50,
-    ).await?;
+    let activities = strava
+        .get_activities(&access_token, Some(after_epoch), None, 50)
+        .await?;
 
     if activities.is_empty() {
         return Ok(());
@@ -214,7 +210,8 @@ pub async fn process_athlete(
         let activity_id = activity.id;
         let seen = tokio::task::spawn_blocking(move || {
             db_clone.run(|conn| db::is_activity_seen(conn, activity_id))
-        }).await??;
+        })
+        .await??;
 
         if seen {
             // Already seen => all older activities also seen (newest-first ordering)
@@ -236,13 +233,15 @@ pub async fn process_athlete(
     // Mark all new activities as seen
     {
         let db_clone = Arc::clone(db);
-        let items: Vec<(i64, i64)> = new_activities.iter()
+        let items: Vec<(i64, i64)> = new_activities
+            .iter()
             .map(|a| (a.activity_id, athlete.strava_id))
             .collect();
         let items_clone = items.clone();
         tokio::task::spawn_blocking(move || {
             db_clone.run(|conn| db::bulk_mark_seen(conn, &items_clone))
-        }).await??;
+        })
+        .await??;
     }
 
     // Cache tracked activities and send notifications
@@ -253,9 +252,8 @@ pub async fn process_athlete(
         // Cache the activity
         let db_clone = Arc::clone(db);
         let c = cached.clone();
-        tokio::task::spawn_blocking(move || {
-            db_clone.run(|conn| db::cache_activity(conn, &c))
-        }).await??;
+        tokio::task::spawn_blocking(move || db_clone.run(|conn| db::cache_activity(conn, &c)))
+            .await??;
 
         // Don't notify on cold start (seeding)
         if !is_cold_start {
@@ -270,11 +268,11 @@ pub async fn process_athlete(
                     let o = db::get_oldest_activity_date(conn, sid)?;
                     Ok((w, m, o))
                 })
-            }).await??;
+            })
+            .await??;
 
-            let (incomplete_week, incomplete_month) = crate::formatting::incomplete_periods(
-                oldest_date,
-            );
+            let (incomplete_week, incomplete_month) =
+                crate::formatting::incomplete_periods(oldest_date);
 
             let msg = crate::formatting::format_activity_message(
                 &athlete.name,

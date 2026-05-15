@@ -1,5 +1,5 @@
-use async_trait::async_trait;
 use anyhow::Result;
+use async_trait::async_trait;
 use serde::Deserialize;
 
 use crate::db::CachedActivity;
@@ -72,7 +72,8 @@ impl StravaClient {
 #[async_trait]
 impl StravaApi for StravaClient {
     async fn exchange_code(&self, code: &str) -> Result<TokenResponse> {
-        let resp = self.http
+        let resp = self
+            .http
             .post("https://www.strava.com/oauth/token")
             .form(&[
                 ("client_id", self.client_id.as_str()),
@@ -92,7 +93,8 @@ impl StravaApi for StravaClient {
     }
 
     async fn refresh_token(&self, refresh_token: &str) -> Result<TokenResponse> {
-        let resp = self.http
+        let resp = self
+            .http
             .post("https://www.strava.com/oauth/token")
             .form(&[
                 ("client_id", self.client_id.as_str()),
@@ -126,7 +128,8 @@ impl StravaApi for StravaClient {
             query.push(("before", b.to_string()));
         }
 
-        let resp = self.http
+        let resp = self
+            .http
             .get("https://www.strava.com/api/v3/athlete/activities")
             .header("Authorization", format!("Bearer {}", access_token))
             .query(&query)
@@ -181,8 +184,8 @@ mod tests {
             athlete: StravaAthleteSummary { id: 456 },
             name: "Run".into(),
             activity_type: "Run".into(),
-            distance: 10000.0,   // 10 km
-            moving_time: 3000,   // 50 min = 3000 seconds
+            distance: 10000.0, // 10 km
+            moving_time: 3000, // 50 min = 3000 seconds
             elapsed_time: 3100,
             start_date: "2024-01-01T00:00:00Z".into(),
             start_date_local: "2024-01-01T08:00:00Z".into(),

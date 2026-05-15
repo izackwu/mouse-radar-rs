@@ -18,10 +18,7 @@ pub fn format_activity_message(
     let emoji = activity_emoji(activity_type);
     let verb = activity_verb(activity_type);
 
-    let mut msg = format!(
-        "{} {} {} {:.1} km",
-        emoji, athlete_name, verb, distance_km
-    );
+    let mut msg = format!("{} {} {} {:.1} km", emoji, athlete_name, verb, distance_km);
 
     // Duration line: either pace + duration, or just duration
     match pace_sec_per_km {
@@ -30,10 +27,7 @@ pub fn format_activity_message(
             format_pace(pace),
             format_duration(duration_s),
         )),
-        None => msg.push_str(&format!(
-            "\n⏱ {}",
-            format_duration(duration_s),
-        )),
+        None => msg.push_str(&format!("\n⏱ {}", format_duration(duration_s),)),
     }
 
     // Mileage stats
@@ -100,8 +94,8 @@ pub fn incomplete_periods(oldest_date: Option<chrono::NaiveDate>) -> (bool, bool
     let monday = today - chrono::Duration::days(i64::from(today.weekday().num_days_from_monday()));
 
     // First of current month
-    let first_of_month = chrono::NaiveDate::from_ymd_opt(today.year(), today.month(), 1)
-        .expect("valid date");
+    let first_of_month =
+        chrono::NaiveDate::from_ymd_opt(today.year(), today.month(), 1).expect("valid date");
 
     (oldest > monday, oldest > first_of_month)
 }
@@ -179,10 +173,10 @@ mod tests {
             "Afternoon Run",
             "Run",
             10.2,
-            Some(286),  // 4:46 /km
-            2982,       // 49:42
-            34.5,       // week km
-            128.3,      // month km
+            Some(286), // 4:46 /km
+            2982,      // 49:42
+            34.5,      // week km
+            128.3,     // month km
             "https://strava.com/activities/123",
             false,
             false,
@@ -220,9 +214,17 @@ mod tests {
     #[test]
     fn test_format_with_incomplete_warning() {
         let msg = format_activity_message(
-            "alice", "Run", "Run", 5.0, Some(300), 1500,
-            5.0, 5.0, "https://example.com/1",
-            true, false,
+            "alice",
+            "Run",
+            "Run",
+            5.0,
+            Some(300),
+            1500,
+            5.0,
+            5.0,
+            "https://example.com/1",
+            true,
+            false,
         );
         assert!(msg.contains("⚠️ Week stats may be incomplete"));
     }
