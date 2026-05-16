@@ -4,7 +4,6 @@ use teloxide::{prelude::*, types::InputFile, utils::command::BotCommands, Reques
 
 use crate::config::Config;
 use crate::db::{self, Db};
-use crate::formatting;
 use crate::strava::TokenResponse;
 
 /// Convert a displayable error into a `RequestError` (for use in ? propagation).
@@ -309,6 +308,7 @@ async fn cmd_latest(
     state: Arc<AppState>,
 ) -> ResponseResult<()> {
     let db = Arc::clone(&state.db);
+    let db2 = Arc::clone(&state.db);
     let name_clone = name.clone();
 
     let result = tokio::task::spawn_blocking(move || {
@@ -319,31 +319,11 @@ async fn cmd_latest(
                 .find(|a| a.name.eq_ignore_ascii_case(&name_clone));
 
             let Some(athlete) = athlete else {
-                return Ok((
-                    None::<db::Athlete>,
-                    None::<db::CachedActivity>,
-                    0.0,
-                    0.0,
-                    false,
-                    false,
-                ));
+                return Ok(None);
             };
 
-            let latest = db::get_latest_activity(conn, athlete.strava_id)?;
-            let (monday, first_of_month) = db::period_boundaries();
-            let week = db::get_week_km(conn, athlete.strava_id, monday)?;
-            let month = db::get_month_km(conn, athlete.strava_id, first_of_month)?;
-            let oldest = db::get_oldest_activity_date(conn, athlete.strava_id)?;
-            let (inc_week, inc_month) = crate::formatting::incomplete_periods(oldest);
-
-            Ok((
-                Some(athlete.clone()),
-                latest,
-                week,
-                month,
-                inc_week,
-                inc_month,
-            ))
+            let activity = db::get_latest_activity(conn, athlete.strava_id)?;
+            Ok(Some((athlete.clone(), activity)))
         })
     })
     .await
@@ -357,60 +337,23 @@ async fn cmd_latest(
     })?;
 
     match result {
-        (Some(athlete), Some(activity), week, month, inc_week, inc_month) => {
-            let activity_type = activity.activity_type;
-
-            // Text message
-            let text = formatting::format_activity_message(
-                &athlete.name,
-                &activity.title,
-                activity_type,
-                activity.distance_km,
-                activity.pace_sec_per_km,
-                activity.duration_s,
-                week,
-                month,
-                &activity.url,
-                inc_week,
-                inc_month,
-            );
-            bot.send_message(msg.chat.id, text).await?;
-
-            // Card image
-            let card_data = crate::card::CardData {
-                activity_type,
-                athlete_name: athlete.name.clone(),
-                title: activity.title,
-                start_date_local: activity.start_date_local,
-                distance_km: activity.distance_km,
-                pace_sec_per_km: activity.pace_sec_per_km,
-                duration_s: activity.duration_s,
-                week_km: week,
-                month_km: month,
-                incomplete_week: inc_week,
-                incomplete_month: inc_month,
-            };
-
-            match crate::card::render_card(&card_data, 4) {
-                Ok(card) => {
-                    let caption = crate::card::format_caption(&activity.url, inc_week, inc_month);
-                    bot.send_photo(msg.chat.id, InputFile::memory(card))
-                        .caption(caption)
-                        .await?;
-                }
-                Err(e) => {
-                    log::error!("Failed to render card: {}", e);
-                }
-            }
+        Some((athlete, Some(activity))) => {
+            let notif = db2
+                .build_notification(&athlete.name, &activity)
+                .map_err(to_request_error)?;
+            bot.send_message(msg.chat.id, notif.text).await?;
+            bot.send_photo(msg.chat.id, InputFile::memory(notif.card_png))
+                .caption(notif.caption)
+                .await?;
         }
-        (Some(_), None, ..) => {
+        Some((_, None)) => {
             bot.send_message(
                 msg.chat.id,
                 format!("No cached activities found for '{}'.", name),
             )
             .await?;
         }
-        _ => {
+        None => {
             bot.send_message(msg.chat.id, format!("Athlete '{}' not found.", name))
                 .await?;
         }

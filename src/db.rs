@@ -33,6 +33,59 @@ impl Db {
         let guard = self.conn.lock().unwrap();
         f(&guard)
     }
+
+    /// Build text message, card PNG, and caption for an activity.
+    ///
+    /// Queries week/month stats from the database automatically.
+    pub fn build_notification(
+        &self,
+        athlete_name: &str,
+        activity: &CachedActivity,
+    ) -> anyhow::Result<crate::card::Notification> {
+        self.run(|conn| {
+            let (monday, first_of_month) = period_boundaries();
+            let week = get_week_km(conn, activity.athlete_id, monday)?;
+            let month = get_month_km(conn, activity.athlete_id, first_of_month)?;
+            let oldest = get_oldest_activity_date(conn, activity.athlete_id)?;
+            let (inc_week, inc_month) = crate::formatting::incomplete_periods(oldest);
+
+            let text = crate::formatting::format_activity_message(
+                athlete_name,
+                &activity.title,
+                activity.activity_type,
+                activity.distance_km,
+                activity.pace_sec_per_km,
+                activity.duration_s,
+                week,
+                month,
+                &activity.url,
+                inc_week,
+                inc_month,
+            );
+
+            let card_data = crate::card::CardData {
+                activity_type: activity.activity_type,
+                athlete_name: athlete_name.to_string(),
+                title: activity.title.clone(),
+                start_date_local: activity.start_date_local.clone(),
+                distance_km: activity.distance_km,
+                pace_sec_per_km: activity.pace_sec_per_km,
+                duration_s: activity.duration_s,
+                week_km: week,
+                month_km: month,
+                incomplete_week: inc_week,
+                incomplete_month: inc_month,
+            };
+
+            let card_png = crate::card::render_card(&card_data, 4)?;
+            let caption = crate::card::format_caption(&activity.url, inc_week, inc_month);
+            Ok(crate::card::Notification {
+                text,
+                card_png,
+                caption,
+            })
+        })
+    }
 }
 
 pub fn init_schema(conn: &Connection) -> Result<()> {

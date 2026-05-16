@@ -259,72 +259,25 @@ pub async fn process_athlete(
 
         // Don't notify on cold start (seeding)
         if !is_cold_start {
-            // Query stats
             let db_clone = Arc::clone(db);
-            let sid = athlete.strava_id;
-            let (monday, first_of_month) = db::period_boundaries();
-            let (week_km, month_km, oldest_date) = tokio::task::spawn_blocking(move || {
-                db_clone.run(|conn| {
-                    let w = db::get_week_km(conn, sid, monday)?;
-                    let m = db::get_month_km(conn, sid, first_of_month)?;
-                    let o = db::get_oldest_activity_date(conn, sid)?;
-                    Ok((w, m, o))
-                })
+            let name = athlete.name.clone();
+            let cached_clone = cached.clone();
+            let notif = tokio::task::spawn_blocking(move || {
+                db_clone.build_notification(&name, &cached_clone)
             })
             .await??;
 
-            let (incomplete_week, incomplete_month) =
-                crate::formatting::incomplete_periods(oldest_date);
-
-            let msg = crate::formatting::format_activity_message(
-                &athlete.name,
-                &cached.title,
-                cached.activity_type,
-                cached.distance_km,
-                cached.pace_sec_per_km,
-                cached.duration_s,
-                week_km,
-                month_km,
-                &cached.url,
-                incomplete_week,
-                incomplete_month,
-            );
-
-            if let Err(e) = bot.send_message(*chat_id, msg).await {
-                error!("Failed to send notification for {}: {}", athlete.name, e);
+            if let Err(e) = bot.send_message(*chat_id, notif.text).await {
+                error!("Failed to send message for {}: {}", athlete.name, e);
+            }
+            if let Err(e) = bot
+                .send_photo(*chat_id, InputFile::memory(notif.card_png))
+                .caption(notif.caption)
+                .await
+            {
+                error!("Failed to send card photo for {}: {}", athlete.name, e);
             } else {
                 info!("Notified: {} - {}", athlete.name, cached.title);
-            }
-
-            // Card image alongside
-            let card_data = crate::card::CardData {
-                activity_type: cached.activity_type,
-                athlete_name: athlete.name.clone(),
-                title: cached.title.clone(),
-                start_date_local: cached.start_date_local.clone(),
-                distance_km: cached.distance_km,
-                pace_sec_per_km: cached.pace_sec_per_km,
-                duration_s: cached.duration_s,
-                week_km,
-                month_km,
-                incomplete_week,
-                incomplete_month,
-            };
-            match crate::card::render_card(&card_data, 4) {
-                Ok(card) => {
-                    let caption =
-                        crate::card::format_caption(&cached.url, incomplete_week, incomplete_month);
-                    if let Err(e) = bot
-                        .send_photo(*chat_id, InputFile::memory(card))
-                        .caption(caption)
-                        .await
-                    {
-                        error!("Failed to send card photo for {}: {}", athlete.name, e);
-                    }
-                }
-                Err(e) => {
-                    error!("Failed to render card for {}: {}", athlete.name, e);
-                }
             }
         }
     }
