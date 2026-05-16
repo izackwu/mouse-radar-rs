@@ -7,6 +7,36 @@ static FONTS: LazyLock<std::sync::Arc<usvg::fontdb::Database>> = LazyLock::new(|
     db.load_font_data(include_bytes!("../fonts/Inter-Regular.ttf").to_vec());
     db.load_font_data(include_bytes!("../fonts/Inter-Bold.ttf").to_vec());
     db.load_font_data(include_bytes!("../fonts/emoji-subset.ttf").to_vec());
+
+    // Preload the platform's color-emoji font BEFORE load_system_fonts, so it ranks first
+    // in usvg's fallback iteration. Otherwise codepoints like ☕ U+2615 (text-default emoji)
+    // get picked up by monochrome fonts (Menlo, Apple Symbols, STIX) which iterate earlier.
+    #[cfg(target_os = "macos")]
+    let _ = db.load_font_file("/System/Library/Fonts/Apple Color Emoji.ttc");
+    #[cfg(target_os = "linux")]
+    let _ = db.load_font_file("/usr/share/fonts/noto/NotoColorEmoji.ttf");
+
+    // CJK + full-emoji fallback. macOS dev: Apple Color Emoji, PingFang, Apple SD Gothic Neo,
+    // etc. Linux/Docker: Noto CJK + Noto Color Emoji installed via apk in the Dockerfile.
+    db.load_system_fonts();
+
+    // LastResort.otf (macOS) claims to support every Unicode codepoint by design (it's
+    // the OS's "no glyph" hint font). When present, usvg's fallback resolver picks it
+    // first and renders everything as "?" boxes. macOS registers it under both
+    // "LastResort" and ".LastResort" (the dot-prefixed internal name), so match both.
+    let last_resort_ids: Vec<_> = db
+        .faces()
+        .filter(|f| {
+            f.families
+                .iter()
+                .any(|(name, _)| name.trim_start_matches('.').starts_with("LastResort"))
+        })
+        .map(|f| f.id)
+        .collect();
+    for id in last_resort_ids {
+        db.remove_face(id);
+    }
+
     std::sync::Arc::new(db)
 });
 
@@ -422,6 +452,49 @@ mod tests {
         };
         let png = render_card(&data, 4).expect("render swim");
         fs::write(format!("{dir}/06-swim.png"), &png).unwrap();
+
+        // Emoji in title and name — renders via system font fallback
+        let data = CardData {
+            activity_type: ActivityType::Run,
+            athlete_name: "👑 Queen Alice".into(),
+            title: "☕ Morning Coffee Run with friends 🥐🥳".into(),
+            ..default_card()
+        };
+        let png = render_card(&data, 4).expect("render emoji title");
+        fs::write(format!("{dir}/07-emoji-title.png"), &png).unwrap();
+
+        // CJK characters — should render correctly
+        let data = CardData {
+            activity_type: ActivityType::Run,
+            athlete_name: "中文用户".into(),
+            title: "日本語ランニング".into(),
+            ..default_card()
+        };
+        let png = render_card(&data, 4).expect("render cjk");
+        fs::write(format!("{dir}/08-cjk.png"), &png).unwrap();
+
+        // Mixed CJK + emoji name + Korean title with emojis.
+        //
+        // Single-codepoint emojis only here. usvg's font fallback in mixed-script text has
+        // known limitations (linebender/resvg#861, linebender/resvg#916):
+        //   - ZWJ-joined emoji (e.g. 🏃‍♀️ = 🏃 + ZWJ + ♀ + VS-16) never compose; at best
+        //     the base char renders and the rest is dropped.
+        //   - Regional-indicator flag pairs (e.g. 🇰🇷) render bare but disappear once mixed
+        //     with any other text — even when wrapped in their own <tspan>.
+        //   - Linux/Noto only: CJK chars followed by a non-ASCII-presentation emoji in the
+        //     same text run render as tofu (e.g. "黑影儿📺" → 4 boxes). Apple Color Emoji
+        //     on macOS doesn't trip this. Title `🏃 서울 마라톤 🏆` is fine on both because
+        //     the emojis are separated from the Korean by spaces.
+        // Wrapping each script run in its own <tspan> works for Korean + simple emoji, but
+        // doesn't recover flags or ZWJ sequences, so we just avoid them in the test fixture.
+        let data = CardData {
+            activity_type: ActivityType::Run,
+            athlete_name: "黑影儿📺".into(),
+            title: "🏃 서울 마라톤 🏆".into(),
+            ..default_card()
+        };
+        let png = render_card(&data, 4).expect("render cjk+emoji");
+        fs::write(format!("{dir}/09-cjk-emoji.png"), &png).unwrap();
 
         // File size sanity
         for entry in fs::read_dir(dir).unwrap() {

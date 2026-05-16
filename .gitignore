@@ -11,3 +11,4 @@ docs/
 .DS_Store
 # Generated
 card-snapshots/
+card-snapshots-linux/
