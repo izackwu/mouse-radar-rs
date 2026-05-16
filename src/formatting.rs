@@ -113,6 +113,7 @@ fn activity_verb(activity_type: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::float_cmp)]
     use super::*;
 
     #[test]
