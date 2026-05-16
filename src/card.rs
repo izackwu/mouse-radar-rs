@@ -9,9 +9,7 @@ const SVG_TEMPLATE: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="64
   <text x="96" y="96" font-size="28" fill="#1a1a1a" font-family="Inter" font-weight="700">{{TITLE}}</text>
   <text x="604" y="64" font-size="16" fill="#999999" font-family="Inter" text-anchor="end">{{DATE}} · {{TIME}}</text>
   <text x="320" y="228" font-size="88" fill="#fc4c02" font-family="Inter" font-weight="800" text-anchor="middle">{{DISTANCE}}<tspan font-size="32" fill="#999999" font-family="Inter" font-weight="500"> km</tspan></text>
-  <text x="320" y="270" font-size="22" fill="#555555" font-family="Inter" text-anchor="middle" {{PACE_STYLE}}>
-    <tspan font-family="Apple Color Emoji">🏁</tspan> {{PACE}}/km  ·  <tspan font-family="Apple Color Emoji">⏱</tspan> {{DURATION}}
-  </text>
+  {{PACE_ROW}}
   <line x1="36" y1="300" x2="604" y2="300" stroke="#f0f0f0" stroke-width="2"/>
   <text x="170" y="360" font-size="16" fill="#aaaaaa" font-family="Inter" font-weight="400" text-anchor="middle">THIS WEEK</text>
   <text x="170" y="410" font-size="34" fill="#1a1a1a" font-family="Inter" font-weight="700" text-anchor="middle">{{WEEK}}<tspan font-size="20" fill="#aaaaaa" font-family="Inter"> km</tspan><tspan font-size="20" fill="#fc4c02" font-family="Inter">{{WEEK_ASTERISK}}</tspan></text>
@@ -85,18 +83,17 @@ pub fn format_caption(url: &str, incomplete_week: bool, incomplete_month: bool) 
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub fn render_card(data: &CardData, scale: f32) -> Result<Vec<u8>> {
     let distance = format!("{:.1}", data.distance_km);
-    let duration = format_duration(data.duration_s);
-    let week = format_km(data.week_km);
-    let month_km = format_km(data.month_km);
+    let duration = crate::formatting::format_duration(data.duration_s);
+    let week = format!("{:.1}", data.week_km);
+    let month_km = format!("{:.1}", data.month_km);
 
-    let pace_style = if data.activity_type.has_pace() {
-        ""
-    } else {
-        "visibility=\"hidden\""
-    };
-
-    let pace = if let Some(sec) = data.pace_sec_per_km {
-        format_pace(sec)
+    let pace_row = if let Some(sec) = data.pace_sec_per_km {
+        let pace_str = crate::formatting::format_pace(sec);
+        format!(
+            r##"  <text x="320" y="270" font-size="22" fill="#555555" font-family="Inter" text-anchor="middle">
+    <tspan font-family="Apple Color Emoji">🏁</tspan> {pace_str}/km  ·  <tspan font-family="Apple Color Emoji">⏱</tspan> {duration}
+  </text>"##
+        )
     } else {
         String::new()
     };
@@ -108,30 +105,29 @@ pub fn render_card(data: &CardData, scale: f32) -> Result<Vec<u8>> {
         SVG_TEMPLATE,
         &[
             ("EMOJI", data.activity_type.emoji()),
-            ("NAME", &truncate(&data.athlete_name, 20)),
+            ("NAME", &truncate(&data.athlete_name, 12)),
             ("ACTIVITY_NOUN", data.activity_type.noun()),
             ("TITLE", &truncate(&data.title, 40)),
             ("DATE", &data.date),
             ("TIME", &data.time_str),
             ("DISTANCE", &distance),
-            ("PACE", &pace),
-            ("DURATION", &duration),
+            ("PACE_ROW", &pace_row),
             ("WEEK", &week),
             ("WEEK_ASTERISK", week_asterisk),
             ("MONTH", &month_km),
             ("MONTH_ASTERISK", month_asterisk),
-            ("PACE_STYLE", pace_style),
         ],
     );
 
     let inter_regular = include_bytes!("../fonts/Inter-Regular.ttf");
     let inter_bold = include_bytes!("../fonts/Inter-Bold.ttf");
+    let emoji_font = include_bytes!("../fonts/emoji-subset.ttf");
 
-    let mut fontdb = usvg::fontdb::Database::new();
-    fontdb.load_font_data(inter_regular.to_vec());
-    fontdb.load_font_data(inter_bold.to_vec());
+    let mut opts = usvg::Options::default();
+    opts.fontdb_mut().load_font_data(inter_regular.to_vec());
+    opts.fontdb_mut().load_font_data(inter_bold.to_vec());
+    opts.fontdb_mut().load_font_data(emoji_font.to_vec());
 
-    let opts = usvg::Options::default();
     let tree = usvg::Tree::from_str(&svg, &opts)?;
 
     let width = (640.0_f32 * scale) as u32;
@@ -145,32 +141,7 @@ pub fn render_card(data: &CardData, scale: f32) -> Result<Vec<u8>> {
     pixmap.encode_png().map_err(Into::into)
 }
 
-fn format_duration(total_seconds: i64) -> String {
-    let hours = total_seconds / 3600;
-    let minutes = (total_seconds % 3600) / 60;
-    let seconds = total_seconds % 60;
 
-    if hours > 0 {
-        format!("{hours}:{minutes:02}:{seconds:02}")
-    } else {
-        format!("{minutes}:{seconds:02}")
-    }
-}
-
-fn format_pace(sec_per_km: i64) -> String {
-    let minutes = sec_per_km / 60;
-    let seconds = sec_per_km % 60;
-    format!("{minutes}:{seconds:02}")
-}
-
-fn format_km(km: f64) -> String {
-    let formatted = format!("{km:.1}");
-    if formatted.ends_with(".0") {
-        formatted[..formatted.len() - 2].to_string()
-    } else {
-        formatted
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -347,45 +318,6 @@ mod tests {
         check_png(&data, 4.0);
     }
 
-    #[test]
-    fn test_format_duration_hours() {
-        assert_eq!(format_duration(3661), "1:01:01");
-    }
-
-    #[test]
-    fn test_format_duration_minutes() {
-        assert_eq!(format_duration(3723), "1:02:03");
-    }
-
-    #[test]
-    fn test_format_duration_under_hour() {
-        assert_eq!(format_duration(270), "4:30");
-    }
-
-    #[test]
-    fn test_format_pace_standard() {
-        assert_eq!(format_pace(286), "4:46");
-    }
-
-    #[test]
-    fn test_format_pace_round() {
-        assert_eq!(format_pace(270), "4:30");
-    }
-
-    #[test]
-    fn test_format_km_whole() {
-        assert_eq!(format_km(34.0), "34");
-    }
-
-    #[test]
-    fn test_format_km_fractional() {
-        assert_eq!(format_km(34.5), "34.5");
-    }
-
-    #[test]
-    fn test_format_km_small() {
-        assert_eq!(format_km(5.1), "5.1");
-    }
 
     #[test]
     fn test_fill_template_replaces_tokens() {
