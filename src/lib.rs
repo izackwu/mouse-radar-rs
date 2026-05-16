@@ -1,3 +1,4 @@
+pub mod card;
 pub mod commands;
 pub mod config;
 pub mod db;

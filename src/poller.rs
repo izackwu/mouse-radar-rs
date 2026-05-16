@@ -4,6 +4,7 @@ use log::{error, info, warn};
 use std::sync::Arc;
 use std::time::Duration;
 use teloxide::prelude::*;
+use teloxide::types::InputFile;
 
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -294,6 +295,39 @@ pub async fn process_athlete(
             } else {
                 info!("Notified: {} - {}", athlete.name, cached.title);
             }
+
+            // Card image alongside
+            let (date_str, time_str) = parse_local_datetime(&cached.start_date_local);
+            let card_data = crate::card::CardData {
+                activity_type: cached.activity_type,
+                athlete_name: athlete.name.clone(),
+                title: cached.title.clone(),
+                date: date_str,
+                time_str,
+                distance_km: cached.distance_km,
+                pace_sec_per_km: cached.pace_sec_per_km,
+                duration_s: cached.duration_s,
+                week_km,
+                month_km,
+                incomplete_week,
+                incomplete_month,
+            };
+            match crate::card::render_card(&card_data, 4.0) {
+                Ok(card) => {
+                    let caption =
+                        crate::card::format_caption(&cached.url, incomplete_week, incomplete_month);
+                    if let Err(e) = bot
+                        .send_photo(*chat_id, InputFile::memory(card))
+                        .caption(caption)
+                        .await
+                    {
+                        error!("Failed to send card photo for {}: {}", athlete.name, e);
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to render card for {}: {}", athlete.name, e);
+                }
+            }
         }
     }
 
@@ -312,6 +346,20 @@ fn parse_iso_to_epoch(iso: &str) -> Option<i64> {
     None
 }
 
+fn parse_local_datetime(iso: &str) -> (String, String) {
+    let dt = chrono::DateTime::parse_from_rfc3339(iso).or_else(|_| {
+        chrono::NaiveDateTime::parse_from_str(iso, "%Y-%m-%dT%H:%M:%SZ").map(|d| d.and_utc().into())
+    });
+    match dt {
+        Ok(dt) => {
+            let date = dt.format("%b %e").to_string();
+            let time = dt.format("%-I:%M %p").to_string();
+            (date.trim().to_string(), time)
+        }
+        Err(_) => (String::new(), String::new()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::float_cmp)]
@@ -326,5 +374,26 @@ mod tests {
     #[test]
     fn test_parse_iso_to_epoch_invalid() {
         assert!(parse_iso_to_epoch("not-a-date").is_none());
+    }
+
+    #[test]
+    fn test_parse_local_datetime_rfc3339() {
+        let (date, time) = parse_local_datetime("2024-05-16T08:30:00Z");
+        assert_eq!(date, "May 16");
+        assert_eq!(time, "8:30 AM");
+    }
+
+    #[test]
+    fn test_parse_local_datetime_naive() {
+        let (date, time) = parse_local_datetime("2024-05-16T14:30:00Z");
+        assert_eq!(date, "May 16");
+        assert_eq!(time, "2:30 PM");
+    }
+
+    #[test]
+    fn test_parse_local_datetime_invalid() {
+        let (date, time) = parse_local_datetime("not-a-date");
+        assert_eq!(date, "");
+        assert_eq!(time, "");
     }
 }
