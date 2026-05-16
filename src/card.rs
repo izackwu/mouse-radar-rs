@@ -141,8 +141,6 @@ pub fn render_card(data: &CardData, scale: f32) -> Result<Vec<u8>> {
     pixmap.encode_png().map_err(Into::into)
 }
 
-
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::float_cmp)]
@@ -317,7 +315,6 @@ mod tests {
         };
         check_png(&data, 4.0);
     }
-
 
     #[test]
     fn test_fill_template_replaces_tokens() {
