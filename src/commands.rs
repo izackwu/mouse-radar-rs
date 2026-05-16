@@ -1,9 +1,10 @@
 use log::info;
 use std::sync::Arc;
-use teloxide::{prelude::*, utils::command::BotCommands, RequestError};
+use teloxide::{prelude::*, types::InputFile, utils::command::BotCommands, RequestError};
 
 use crate::config::Config;
 use crate::db::{self, Db};
+use crate::formatting;
 use crate::strava::TokenResponse;
 
 /// Convert a displayable error into a `RequestError` (for use in ? propagation).
@@ -24,6 +25,8 @@ pub enum Command {
     Register(String),
     #[command(description = "Authorize an athlete with OAuth code (admin only)")]
     Auth(String),
+    #[command(description = "Show the latest activity for an athlete with card image")]
+    Latest(String),
 }
 
 #[derive(Clone)]
@@ -74,20 +77,13 @@ pub async fn handle_command(
             let code = parts.get(2).copied().unwrap_or("").to_string();
             cmd_auth(bot, msg, name, strava_id, code, state).await
         }
+        Command::Latest(name) => cmd_latest(bot, msg, name, state).await,
     }
 }
 
 async fn cmd_help(bot: Bot, msg: Message) -> ResponseResult<()> {
-    bot.send_message(
-        msg.chat.id,
-        "/help — Show this help message\n\
-         /list — List all tracked athletes\n\
-         /strava <name> — Show stats for an athlete\n\
-         /register <name> <strava_id> — Register a new athlete (admin only)\n\
-         /auth <name> <strava_id> <code> — Authorize athlete with OAuth code (admin only)"
-            .to_string(),
-    )
-    .await?;
+    bot.send_message(msg.chat.id, Command::descriptions().to_string())
+        .await?;
     Ok(())
 }
 
@@ -302,6 +298,123 @@ async fn cmd_auth(
     let _ = state
         .poll_tx
         .send(crate::poller::PollCommand::ColdStart(strava_id_int));
+
+    Ok(())
+}
+
+async fn cmd_latest(
+    bot: Bot,
+    msg: Message,
+    name: String,
+    state: Arc<AppState>,
+) -> ResponseResult<()> {
+    let db = Arc::clone(&state.db);
+    let name_clone = name.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        db.run(|conn| {
+            let athletes = db::list_athletes(conn)?;
+            let athlete = athletes
+                .iter()
+                .find(|a| a.name.eq_ignore_ascii_case(&name_clone));
+
+            let Some(athlete) = athlete else {
+                return Ok((
+                    None::<db::Athlete>,
+                    None::<db::CachedActivity>,
+                    0.0,
+                    0.0,
+                    false,
+                    false,
+                ));
+            };
+
+            let latest = db::get_latest_activity(conn, athlete.strava_id)?;
+            let (monday, first_of_month) = db::period_boundaries();
+            let week = db::get_week_km(conn, athlete.strava_id, monday)?;
+            let month = db::get_month_km(conn, athlete.strava_id, first_of_month)?;
+            let oldest = db::get_oldest_activity_date(conn, athlete.strava_id)?;
+            let (inc_week, inc_month) = crate::formatting::incomplete_periods(oldest);
+
+            Ok((
+                Some(athlete.clone()),
+                latest,
+                week,
+                month,
+                inc_week,
+                inc_month,
+            ))
+        })
+    })
+    .await
+    .map_err(|e| {
+        log::error!("DB join error: {}", e);
+        to_request_error(e)
+    })?
+    .map_err(|e| {
+        log::error!("DB error: {}", e);
+        to_request_error(e)
+    })?;
+
+    match result {
+        (Some(athlete), Some(activity), week, month, inc_week, inc_month) => {
+            let activity_type = activity.activity_type;
+
+            // Text message
+            let text = formatting::format_activity_message(
+                &athlete.name,
+                &activity.title,
+                activity_type,
+                activity.distance_km,
+                activity.pace_sec_per_km,
+                activity.duration_s,
+                week,
+                month,
+                &activity.url,
+                inc_week,
+                inc_month,
+            );
+            bot.send_message(msg.chat.id, text).await?;
+
+            // Card image
+            let card_data = crate::card::CardData {
+                activity_type,
+                athlete_name: athlete.name.clone(),
+                title: activity.title,
+                start_date_local: activity.start_date_local,
+                distance_km: activity.distance_km,
+                pace_sec_per_km: activity.pace_sec_per_km,
+                duration_s: activity.duration_s,
+                week_km: week,
+                month_km: month,
+                incomplete_week: inc_week,
+                incomplete_month: inc_month,
+            };
+
+            match crate::card::render_card(&card_data, 4) {
+                Ok(card) => {
+                    let caption = crate::card::format_caption(&activity.url, inc_week, inc_month);
+                    bot.send_photo(msg.chat.id, InputFile::memory(card))
+                        .caption(caption)
+                        .await?;
+                }
+                Err(e) => {
+                    log::error!("Failed to render card: {}", e);
+                }
+            }
+        }
+        (Some(_), None, ..) => {
+            bot.send_message(
+                msg.chat.id,
+                format!("No cached activities found for '{}'.", name),
+            )
+            .await?;
+        }
+        _ => {
+            bot.send_message(msg.chat.id, format!("Athlete '{}' not found.", name))
+                .await?;
+        }
+    }
 
     Ok(())
 }
