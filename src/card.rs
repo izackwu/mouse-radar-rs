@@ -47,8 +47,7 @@ pub struct CardData {
     pub activity_type: ActivityType,
     pub athlete_name: String,
     pub title: String,
-    pub date: String,
-    pub time_str: String,
+    pub start_date_local: String, // ISO 8601 datetime in athlete's local timezone
     pub distance_km: f64,
     pub pace_sec_per_km: Option<i64>,
     pub duration_s: i64,
@@ -73,15 +72,15 @@ pub fn format_caption(url: &str, incomplete_week: bool, incomplete_month: bool) 
 
 /// Render an activity card SVG, returning PNG bytes at the given scale.
 ///
-/// `scale` multiplies the 640x450 logical SVG dimensions (e.g., 4.0 -> 2560x1800 px).
-/// The Inter fonts are compiled into the binary; emoji rendering relies on system fonts
-/// (Apple Color Emoji on macOS, Noto Color Emoji on Linux).
+/// `scale` multiplies the 640×450 logical SVG dimensions (e.g., 4 → 2560×1800 px).
+/// Inter and emoji fonts are compiled into the binary via `include_bytes!`.
 ///
 /// # Errors
 ///
-/// Returns an error if the SVG cannot be parsed, fonts cannot be loaded, or rendering fails.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-pub fn render_card(data: &CardData, scale: f32) -> Result<Vec<u8>> {
+/// Returns an error if the SVG cannot be parsed or rendering fails.
+#[allow(clippy::cast_precision_loss)]
+pub fn render_card(data: &CardData, scale: u32) -> Result<Vec<u8>> {
+    let (date_str, time_str) = parse_local_datetime(&data.start_date_local);
     let distance = format!("{:.1}", data.distance_km);
     let duration = crate::formatting::format_duration(data.duration_s);
     let week = format!("{:.1}", data.week_km);
@@ -108,8 +107,8 @@ pub fn render_card(data: &CardData, scale: f32) -> Result<Vec<u8>> {
             ("NAME", &truncate(&data.athlete_name, 12)),
             ("ACTIVITY_NOUN", data.activity_type.noun()),
             ("TITLE", &truncate(&data.title, 40)),
-            ("DATE", &data.date),
-            ("TIME", &data.time_str),
+            ("DATE", &date_str),
+            ("TIME", &time_str),
             ("DISTANCE", &distance),
             ("PACE_ROW", &pace_row),
             ("WEEK", &week),
@@ -130,15 +129,31 @@ pub fn render_card(data: &CardData, scale: f32) -> Result<Vec<u8>> {
 
     let tree = usvg::Tree::from_str(&svg, &opts)?;
 
-    let width = (640.0_f32 * scale) as u32;
-    let height = (450.0_f32 * scale) as u32;
+    let width = 640 * scale;
+    let height = 450 * scale;
     let mut pixmap = tiny_skia::Pixmap::new(width, height)
         .ok_or_else(|| anyhow::anyhow!("Failed to create pixmap"))?;
 
-    let transform = tiny_skia::Transform::from_scale(scale, scale);
+    let transform = tiny_skia::Transform::from_scale(scale as f32, scale as f32);
     resvg::render(&tree, transform, &mut pixmap.as_mut());
 
     pixmap.encode_png().map_err(Into::into)
+}
+
+/// Parse an ISO 8601 datetime string into ("Mon DD", "H:MM AM") format.
+/// Returns empty strings if parsing fails.
+fn parse_local_datetime(iso: &str) -> (String, String) {
+    let dt = chrono::DateTime::parse_from_rfc3339(iso).or_else(|_| {
+        chrono::NaiveDateTime::parse_from_str(iso, "%Y-%m-%dT%H:%M:%SZ").map(|d| d.and_utc().into())
+    });
+    match dt {
+        Ok(dt) => {
+            let date = dt.format("%b %e").to_string();
+            let time = dt.format("%-I:%M %p").to_string();
+            (date.trim().to_string(), time)
+        }
+        Err(_) => (String::new(), String::new()),
+    }
 }
 
 #[cfg(test)]
@@ -154,8 +169,7 @@ mod tests {
             activity_type: ActivityType::Run,
             athlete_name: "Alice".into(),
             title: "Morning Run".into(),
-            date: "May 16".into(),
-            time_str: "8:30 AM".into(),
+            start_date_local: "2026-05-16T08:30:00Z".into(),
             distance_km: 10.2,
             pace_sec_per_km: Some(286),
             duration_s: 2982,
@@ -201,7 +215,7 @@ mod tests {
     }
 
     /// Renders a card, verifies PNG output is non-empty and starts with PNG magic bytes.
-    fn check_png(data: &CardData, scale: f32) -> Vec<u8> {
+    fn check_png(data: &CardData, scale: u32) -> Vec<u8> {
         let png = render_card(data, scale).expect("render_card should succeed");
         // Check non-empty
         assert!(!png.is_empty(), "PNG output should not be empty");
@@ -215,7 +229,7 @@ mod tests {
     #[test]
     fn test_render_card_basic_run() {
         let data = default_card();
-        check_png(&data, 4.0);
+        check_png(&data, 4);
     }
 
     #[test]
@@ -225,7 +239,7 @@ mod tests {
             pace_sec_per_km: None,
             ..default_card()
         };
-        check_png(&data, 4.0);
+        check_png(&data, 4);
     }
 
     #[test]
@@ -235,7 +249,7 @@ mod tests {
             incomplete_month: true,
             ..default_card()
         };
-        check_png(&data, 4.0);
+        check_png(&data, 4);
     }
 
     #[test]
@@ -244,7 +258,7 @@ mod tests {
             title: "A very long run title that should be truncated in the card".into(),
             ..default_card()
         };
-        check_png(&data, 4.0);
+        check_png(&data, 4);
     }
 
     #[test]
@@ -253,13 +267,13 @@ mod tests {
             athlete_name: "Alexander Benjamin Christopher".into(),
             ..default_card()
         };
-        check_png(&data, 4.0);
+        check_png(&data, 4);
     }
 
     #[test]
     fn test_render_card_4x_dimensions() {
         let data = default_card();
-        let png = check_png(&data, 4.0);
+        let png = check_png(&data, 4);
         // For a 4x render at 640x450 base, output should be 2560x1800
         // Read width/height from PNG IHDR (bytes 16-19 = width, 20-23 = height, big-endian)
         let width = u32::from_be_bytes([png[16], png[17], png[18], png[19]]);
@@ -275,20 +289,18 @@ mod tests {
             pace_sec_per_km: None,
             ..default_card()
         };
-        check_png(&data, 4.0);
+        check_png(&data, 4);
     }
 
     #[test]
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn test_render_card_different_scales() {
-        // Verify rendering works at various scales
         let data = default_card();
-        for scale in [1.0, 2.0, 3.0] {
+        for &scale in &[1, 2, 3] {
             let png = render_card(&data, scale).expect("should render at any scale");
             let width = u32::from_be_bytes([png[16], png[17], png[18], png[19]]);
             let height = u32::from_be_bytes([png[20], png[21], png[22], png[23]]);
-            assert_eq!(width, (640.0_f32 * scale) as u32);
-            assert_eq!(height, (450.0_f32 * scale) as u32);
+            assert_eq!(width, 640 * scale);
+            assert_eq!(height, 450 * scale);
         }
     }
 
@@ -300,7 +312,7 @@ mod tests {
             pace_sec_per_km: None,
             ..default_card()
         };
-        check_png(&data, 4.0);
+        check_png(&data, 4);
     }
 
     #[test]
@@ -313,7 +325,7 @@ mod tests {
             duration_s: 7200,
             ..default_card()
         };
-        check_png(&data, 4.0);
+        check_png(&data, 4);
     }
 
     #[test]
@@ -336,7 +348,7 @@ mod tests {
 
         // Run — all stats present
         let data = default_card();
-        let png = render_card(&data, 4.0).expect("render default card");
+        let png = render_card(&data, 4).expect("render default card");
         fs::write(format!("{dir}/01-run.png"), &png).unwrap();
 
         // Hike — no pace, different emoji
@@ -349,7 +361,7 @@ mod tests {
             duration_s: 5400,
             ..default_card()
         };
-        let png = render_card(&data, 4.0).expect("render hike");
+        let png = render_card(&data, 4).expect("render hike");
         fs::write(format!("{dir}/02-hike.png"), &png).unwrap();
 
         // Ride — different emoji, long distance
@@ -363,7 +375,7 @@ mod tests {
             month_km: 850.0,
             ..default_card()
         };
-        let png = render_card(&data, 4.0).expect("render ride");
+        let png = render_card(&data, 4).expect("render ride");
         fs::write(format!("{dir}/03-ride.png"), &png).unwrap();
 
         // Incomplete stats
@@ -374,7 +386,7 @@ mod tests {
             incomplete_month: true,
             ..default_card()
         };
-        let png = render_card(&data, 4.0).expect("render incomplete");
+        let png = render_card(&data, 4).expect("render incomplete");
         fs::write(format!("{dir}/04-incomplete.png"), &png).unwrap();
 
         // Long title + name
@@ -383,7 +395,7 @@ mod tests {
             title: "A very long run title for testing truncation behavior".into(),
             ..default_card()
         };
-        let png = render_card(&data, 4.0).expect("render long text");
+        let png = render_card(&data, 4).expect("render long text");
         fs::write(format!("{dir}/05-long-text.png"), &png).unwrap();
 
         // Swim (Other-like, no pace)
@@ -396,7 +408,7 @@ mod tests {
             duration_s: 3600,
             ..default_card()
         };
-        let png = render_card(&data, 4.0).expect("render swim");
+        let png = render_card(&data, 4).expect("render swim");
         fs::write(format!("{dir}/06-swim.png"), &png).unwrap();
 
         // File size sanity
