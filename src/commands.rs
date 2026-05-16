@@ -1,6 +1,6 @@
 use log::info;
 use std::sync::Arc;
-use teloxide::{prelude::*, utils::command::BotCommands, RequestError};
+use teloxide::{prelude::*, types::InputFile, utils::command::BotCommands, RequestError};
 
 use crate::config::Config;
 use crate::db::{self, Db};
@@ -24,6 +24,8 @@ pub enum Command {
     Register(String),
     #[command(description = "Authorize an athlete with OAuth code (admin only)")]
     Auth(String),
+    #[command(description = "Show the latest activity for an athlete with card image")]
+    Latest(String),
 }
 
 #[derive(Clone)]
@@ -74,20 +76,13 @@ pub async fn handle_command(
             let code = parts.get(2).copied().unwrap_or("").to_string();
             cmd_auth(bot, msg, name, strava_id, code, state).await
         }
+        Command::Latest(name) => cmd_latest(bot, msg, name, state).await,
     }
 }
 
 async fn cmd_help(bot: Bot, msg: Message) -> ResponseResult<()> {
-    bot.send_message(
-        msg.chat.id,
-        "/help — Show this help message\n\
-         /list — List all tracked athletes\n\
-         /strava <name> — Show stats for an athlete\n\
-         /register <name> <strava_id> — Register a new athlete (admin only)\n\
-         /auth <name> <strava_id> <code> — Authorize athlete with OAuth code (admin only)"
-            .to_string(),
-    )
-    .await?;
+    bot.send_message(msg.chat.id, Command::descriptions().to_string())
+        .await?;
     Ok(())
 }
 
@@ -302,6 +297,67 @@ async fn cmd_auth(
     let _ = state
         .poll_tx
         .send(crate::poller::PollCommand::ColdStart(strava_id_int));
+
+    Ok(())
+}
+
+async fn cmd_latest(
+    bot: Bot,
+    msg: Message,
+    name: String,
+    state: Arc<AppState>,
+) -> ResponseResult<()> {
+    let db = Arc::clone(&state.db);
+    let db2 = Arc::clone(&state.db);
+    let name_clone = name.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        db.run(|conn| {
+            let athletes = db::list_athletes(conn)?;
+            let athlete = athletes
+                .iter()
+                .find(|a| a.name.eq_ignore_ascii_case(&name_clone));
+
+            let Some(athlete) = athlete else {
+                return Ok(None);
+            };
+
+            let activity = db::get_latest_activity(conn, athlete.strava_id)?;
+            Ok(Some((athlete.clone(), activity)))
+        })
+    })
+    .await
+    .map_err(|e| {
+        log::error!("DB join error: {}", e);
+        to_request_error(e)
+    })?
+    .map_err(|e| {
+        log::error!("DB error: {}", e);
+        to_request_error(e)
+    })?;
+
+    match result {
+        Some((athlete, Some(activity))) => {
+            let notif = db2
+                .build_notification(&athlete.name, &activity)
+                .map_err(to_request_error)?;
+            bot.send_message(msg.chat.id, notif.text).await?;
+            bot.send_photo(msg.chat.id, InputFile::memory(notif.card_png))
+                .caption(notif.caption)
+                .await?;
+        }
+        Some((_, None)) => {
+            bot.send_message(
+                msg.chat.id,
+                format!("No cached activities found for '{}'.", name),
+            )
+            .await?;
+        }
+        None => {
+            bot.send_message(msg.chat.id, format!("Athlete '{}' not found.", name))
+                .await?;
+        }
+    }
 
     Ok(())
 }

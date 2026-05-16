@@ -66,6 +66,13 @@ pub struct CardData {
     pub incomplete_month: bool,
 }
 
+/// The result of building a notification: text message, card image, and caption.
+pub struct Notification {
+    pub text: String,
+    pub card_png: Vec<u8>,
+    pub caption: String,
+}
+
 /// Format the caption that accompanies the card photo.
 #[must_use]
 pub fn format_caption(url: &str, incomplete_week: bool, incomplete_month: bool) -> String {
