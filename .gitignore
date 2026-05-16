@@ -5,9 +5,11 @@
 data/
 # AI
 docs/
+.claude/
 .superpowers/
 *.local.*
 # MacOS
 .DS_Store
 # Generated
 card-snapshots/
+card-snapshots-linux/

@@ -17,7 +17,7 @@ RUN cargo build --release
 
 FROM alpine:3.21
 
-RUN apk add --no-cache ca-certificates
+RUN apk add --no-cache ca-certificates font-noto-cjk font-noto-emoji
 
 WORKDIR /app
 COPY --from=builder /app/target/release/mouse-radar-rs /app/mouse-radar-rs
