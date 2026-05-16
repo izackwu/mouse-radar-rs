@@ -20,5 +20,6 @@ RUN apk add --no-cache ca-certificates
 
 WORKDIR /app
 COPY --from=builder /app/target/release/mouse-radar-rs /app/mouse-radar-rs
+COPY fonts/ /app/fonts/
 
 CMD ["/app/mouse-radar-rs"]

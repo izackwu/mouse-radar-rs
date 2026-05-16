@@ -9,3 +9,5 @@ docs/
 *.local.*
 # MacOS
 .DS_Store
+# Generated
+card-snapshots/
