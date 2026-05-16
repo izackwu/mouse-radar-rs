@@ -5,26 +5,25 @@
 # ]
 # ///
 """Regenerate emoji-subset.ttf from macOS Apple Color Emoji font."""
-import subprocess, sys
 from pathlib import Path
+
+from fontTools.subset import Subsetter
 from fontTools.ttLib import TTFont
 
 FONT = "/System/Library/Fonts/Apple Color Emoji.ttc"
-UNICODES = ["U+1F3C3", "U+1F6B4", "U+1F97E", "U+1F6B6", "U+1F3C1", "U+23F1", "U+1F3C5"]
+EMOJIS = ["🏃", "🚴", "🥾", "🚶", "🏁", "⏱", "🏅"]
 OUTPUT = Path(__file__).parent.parent / "fonts" / "emoji-subset.ttf"
 
-result = subprocess.run([
-    "uvx", "fonttools", "subset", FONT,
-    "--font-number=0",
-    "--unicodes=" + ",".join(UNICODES),
-    "--output-file=" + str(OUTPUT),
-], capture_output=True, text=True)
-if result.returncode != 0:
-    print(result.stderr)
-    sys.exit(1)
+font = TTFont(FONT, fontNumber=0)
+subsetter = Subsetter()
+subsetter.populate(unicodes=[ord(c) for c in EMOJIS])
+subsetter.subset(font)
 
+# Restore name table (stripped by subsetter)
 orig = TTFont(FONT, fontNumber=0)
-subset = TTFont(OUTPUT)
-subset["name"] = orig["name"]
-subset.save(OUTPUT)
-print(f"Done: {OUTPUT} ({len(subset.getGlyphOrder())} glyphs)")
+font["name"] = orig["name"]
+orig.close()
+
+font.save(OUTPUT)
+print(f"Done: {OUTPUT} ({len(font.getGlyphOrder())} glyphs)")
+font.close()
