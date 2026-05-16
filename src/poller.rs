@@ -4,6 +4,7 @@ use log::{error, info, warn};
 use std::sync::Arc;
 use std::time::Duration;
 use teloxide::prelude::*;
+use teloxide::types::InputFile;
 
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -293,6 +294,37 @@ pub async fn process_athlete(
                 error!("Failed to send notification for {}: {}", athlete.name, e);
             } else {
                 info!("Notified: {} - {}", athlete.name, cached.title);
+            }
+
+            // Card image alongside
+            let card_data = crate::card::CardData {
+                activity_type: cached.activity_type,
+                athlete_name: athlete.name.clone(),
+                title: cached.title.clone(),
+                start_date_local: cached.start_date_local.clone(),
+                distance_km: cached.distance_km,
+                pace_sec_per_km: cached.pace_sec_per_km,
+                duration_s: cached.duration_s,
+                week_km,
+                month_km,
+                incomplete_week,
+                incomplete_month,
+            };
+            match crate::card::render_card(&card_data, 4) {
+                Ok(card) => {
+                    let caption =
+                        crate::card::format_caption(&cached.url, incomplete_week, incomplete_month);
+                    if let Err(e) = bot
+                        .send_photo(*chat_id, InputFile::memory(card))
+                        .caption(caption)
+                        .await
+                    {
+                        error!("Failed to send card photo for {}: {}", athlete.name, e);
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to render card for {}: {}", athlete.name, e);
+                }
             }
         }
     }
