@@ -11,6 +11,7 @@ RUN cargo build --release 2>/dev/null; true  # pre-fetch dependency crates
 
 # Now copy real source and build
 RUN rm -rf src
+COPY fonts/ fonts/
 COPY src/ src/
 RUN cargo build --release
 
