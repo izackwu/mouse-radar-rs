@@ -4,6 +4,7 @@ use std::sync::Arc;
 use mouse_radar_rs::db::{self, CachedActivity, Db};
 use mouse_radar_rs::formatting;
 use mouse_radar_rs::strava::{StravaActivity, StravaApi, StravaAthleteSummary, TokenResponse};
+use mouse_radar_rs::types::ActivityType;
 
 /// Mock Strava client that returns canned data.
 struct MockStrava {
@@ -100,7 +101,7 @@ async fn test_full_pipeline_with_mock() {
     let msg = formatting::format_activity_message(
         "testuser",
         "Morning Run",
-        "Run",
+        ActivityType::Run,
         5.0,
         Some(300),
         1600,
@@ -132,7 +133,7 @@ fn test_cache_survives_reopen() {
                     activity_id: 1,
                     athlete_id: 1,
                     title: "Run".into(),
-                    activity_type: "Run".into(),
+                    activity_type: ActivityType::Run,
                     distance_km: 8.0,
                     duration_s: 2400,
                     pace_sec_per_km: Some(300),

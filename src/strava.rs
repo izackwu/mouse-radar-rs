@@ -3,6 +3,8 @@ use async_trait::async_trait;
 use serde::Deserialize;
 
 use crate::db::CachedActivity;
+use crate::types::ActivityType;
+use std::str::FromStr;
 
 // --- OAuth types ---
 
@@ -162,7 +164,8 @@ pub fn to_cached(activity: &StravaActivity) -> CachedActivity {
         activity_id: activity.id,
         athlete_id: activity.athlete.id,
         title: activity.name.clone(),
-        activity_type: activity.activity_type.clone(),
+        activity_type: ActivityType::from_str(&activity.activity_type)
+            .unwrap_or(ActivityType::Other),
         distance_km: activity.distance / 1000.0,
         duration_s: activity.elapsed_time,
         pace_sec_per_km: pace,

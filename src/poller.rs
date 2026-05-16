@@ -10,6 +10,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use crate::config::Config;
 use crate::db::{self, CachedActivity, Db};
 use crate::strava::{to_cached, StravaApi};
+use crate::types::ActivityType;
 
 pub enum PollCommand {
     PollAll,
@@ -33,7 +34,7 @@ pub async fn run_poll_cycle(
         return Ok(());
     }
 
-    let tracked: Vec<String> = config.tracked_activity_types.clone();
+    let tracked = config.tracked_activity_types.clone();
     let lookback = chrono::Duration::days(config.cold_start_lookback_days);
 
     for athlete in &athletes {
@@ -140,7 +141,7 @@ pub async fn process_athlete(
     bot: &Bot,
     chat_id: &ChatId,
     athlete: &db::Athlete,
-    tracked_types: &[String],
+    tracked_types: &[ActivityType],
     lookback: chrono::Duration,
 ) -> Result<()> {
     // 1. Refresh token if expiring within 1 hour
@@ -277,7 +278,7 @@ pub async fn process_athlete(
             let msg = crate::formatting::format_activity_message(
                 &athlete.name,
                 &cached.title,
-                &cached.activity_type,
+                cached.activity_type,
                 cached.distance_km,
                 cached.pace_sec_per_km,
                 cached.duration_s,

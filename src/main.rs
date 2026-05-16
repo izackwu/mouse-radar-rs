@@ -4,6 +4,7 @@ pub mod db;
 pub mod formatting;
 pub mod poller;
 pub mod strava;
+pub mod types;
 
 use log::{debug, info};
 use std::sync::Arc;
