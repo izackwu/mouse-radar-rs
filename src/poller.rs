@@ -314,12 +314,13 @@ fn parse_iso_to_epoch(iso: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::float_cmp)]
     use super::*;
 
     #[test]
     fn test_parse_iso_to_epoch_valid() {
         let epoch = parse_iso_to_epoch("2024-01-15T08:30:00Z").unwrap();
-        assert_eq!(epoch, 1705307400);
+        assert_eq!(epoch, 1_705_307_400);
     }
 
     #[test]

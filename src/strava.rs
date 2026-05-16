@@ -176,6 +176,7 @@ pub fn to_cached(activity: &StravaActivity) -> CachedActivity {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::float_cmp)]
     use super::*;
 
     #[test]

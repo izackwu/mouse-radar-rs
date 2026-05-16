@@ -1,3 +1,5 @@
+#![allow(clippy::float_cmp)]
+
 use async_trait::async_trait;
 use std::sync::Arc;
 
@@ -41,7 +43,7 @@ async fn test_full_pipeline_with_mock() {
     let db = Arc::new(Db::open(db_path.to_str().unwrap()).unwrap());
 
     // Insert a test athlete
-    db.run(|conn| db::insert_athlete(conn, 12345, "testuser", "acc", "ref", 9999999999))
+    db.run(|conn| db::insert_athlete(conn, 12345, "testuser", "acc", "ref", 9_999_999_999))
         .unwrap();
 
     // Create mock Strava with one activity
@@ -60,7 +62,7 @@ async fn test_full_pipeline_with_mock() {
         token_response: Some(TokenResponse {
             access_token: "acc".into(),
             refresh_token: "ref".into(),
-            expires_at: 9999999999,
+            expires_at: 9_999_999_999,
             expires_in: 21600,
         }),
     });

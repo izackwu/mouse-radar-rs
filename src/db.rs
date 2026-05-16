@@ -331,6 +331,7 @@ pub fn get_last_activity_date(conn: &Connection, athlete_id: i64) -> Result<Opti
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::float_cmp)]
     use super::*;
     use tempfile::tempdir;
 
@@ -353,7 +354,7 @@ mod tests {
             let tables: Vec<String> = stmt
                 .query_map([], |row| row.get(0))
                 .unwrap()
-                .filter_map(|r| r.ok())
+                .filter_map(Result::ok)
                 .collect();
 
             assert_eq!(
@@ -370,14 +371,14 @@ mod tests {
         let db = test_db();
 
         db.run(|conn| {
-            insert_athlete(conn, 12345, "alice", "acc_tok", "ref_tok", 1710000000).unwrap();
+            insert_athlete(conn, 12345, "alice", "acc_tok", "ref_tok", 1_710_000_000).unwrap();
 
             let a = get_athlete(conn, 12345).unwrap().unwrap();
             assert_eq!(a.strava_id, 12345);
             assert_eq!(a.name, "alice");
             assert_eq!(a.access_token, "acc_tok");
             assert_eq!(a.refresh_token, "ref_tok");
-            assert_eq!(a.token_expires, 1710000000);
+            assert_eq!(a.token_expires, 1_710_000_000);
             Ok(())
         })
         .unwrap();
@@ -510,7 +511,7 @@ mod tests {
                     duration_s: 1800,
                     pace_sec_per_km: None,
                     start_date_local: date1.into(),
-                    url: "".into(),
+                    url: String::new(),
                 },
             )
             .unwrap();
@@ -525,7 +526,7 @@ mod tests {
                     duration_s: 2700,
                     pace_sec_per_km: None,
                     start_date_local: date2.into(),
-                    url: "".into(),
+                    url: String::new(),
                 },
             )
             .unwrap();
@@ -566,7 +567,7 @@ mod tests {
                     duration_s: 1800,
                     pace_sec_per_km: None,
                     start_date_local: "2026-05-10T23:00:00".into(), // Sunday
-                    url: "".into(),
+                    url: String::new(),
                 },
             )
             .unwrap();
@@ -601,7 +602,7 @@ mod tests {
                     duration_s: 1800,
                     pace_sec_per_km: None,
                     start_date_local: "2026-05-11T00:01:00".into(), // Monday
-                    url: "".into(),
+                    url: String::new(),
                 },
             )
             .unwrap();
@@ -636,7 +637,7 @@ mod tests {
                     duration_s: 3600,
                     pace_sec_per_km: None,
                     start_date_local: "2026-05-31T22:00:00".into(),
-                    url: "".into(),
+                    url: String::new(),
                 },
             )
             .unwrap();
@@ -651,7 +652,7 @@ mod tests {
                     duration_s: 900,
                     pace_sec_per_km: None,
                     start_date_local: "2026-06-01T06:00:00".into(),
-                    url: "".into(),
+                    url: String::new(),
                 },
             )
             .unwrap();
@@ -692,7 +693,7 @@ mod tests {
                         duration_s: 600,
                         pace_sec_per_km: None,
                         start_date_local: time_str.into(),
-                        url: "".into(),
+                        url: String::new(),
                     },
                 )
                 .unwrap();
@@ -714,7 +715,7 @@ mod tests {
                     duration_s: 300,
                     pace_sec_per_km: None,
                     start_date_local: "2026-05-10T23:59:00".into(),
-                    url: "".into(),
+                    url: String::new(),
                 },
             )
             .unwrap();
@@ -746,7 +747,7 @@ mod tests {
                     duration_s: 1800,
                     pace_sec_per_km: None,
                     start_date_local: "2024-01-01T00:00:00Z".into(),
-                    url: "".into(),
+                    url: String::new(),
                 },
             )
             .unwrap();
@@ -761,7 +762,7 @@ mod tests {
                     duration_s: 1800,
                     pace_sec_per_km: None,
                     start_date_local: "2024-01-15T00:00:00Z".into(),
-                    url: "".into(),
+                    url: String::new(),
                 },
             )
             .unwrap();
@@ -800,7 +801,7 @@ mod tests {
                         duration_s: 100,
                         pace_sec_per_km: None,
                         start_date_local: today.clone(),
-                        url: "".into(),
+                        url: String::new(),
                     },
                     CachedActivity {
                         activity_id: 2,
@@ -811,7 +812,7 @@ mod tests {
                         duration_s: 200,
                         pace_sec_per_km: None,
                         start_date_local: today.clone(),
-                        url: "".into(),
+                        url: String::new(),
                     },
                 ],
             )

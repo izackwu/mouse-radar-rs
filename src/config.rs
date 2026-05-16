@@ -53,9 +53,13 @@ fn parse_env_default<T: std::str::FromStr>(key: &str, default: T) -> T {
 mod tests {
     use super::*;
     use std::env;
+    use std::sync::Mutex;
+
+    static CONFIG_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_parse_config_from_env() {
+        let _guard = CONFIG_LOCK.lock().unwrap();
         env::set_var("TELEGRAM_BOT_TOKEN", "test-token");
         env::set_var("TELEGRAM_CHAT_ID", "-123");
         env::set_var("STRAVA_CLIENT_ID", "client-id");
@@ -83,6 +87,7 @@ mod tests {
 
     #[test]
     fn test_defaults() {
+        let _guard = CONFIG_LOCK.lock().unwrap();
         env::remove_var("POLL_INTERVAL_SECONDS");
         env::remove_var("BOT_ADMIN_USERNAMES");
         env::remove_var("DATABASE_PATH");

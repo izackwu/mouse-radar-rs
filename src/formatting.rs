@@ -28,7 +28,7 @@ pub fn format_activity_message(
             format_pace(pace),
             format_duration(duration_s),
         )),
-        None => msg.push_str(&format!("\n⏱ {}", format_duration(duration_s),)),
+        None => msg.push_str(&format!("\n⏱ {}", format_duration(duration_s))),
     }
 
     // Mileage stats
@@ -92,6 +92,7 @@ pub fn incomplete_periods(oldest_date: Option<chrono::NaiveDate>) -> (bool, bool
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::float_cmp)]
     use super::*;
 
     #[test]
