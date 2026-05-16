@@ -4,7 +4,6 @@ use serde::Deserialize;
 
 use crate::db::CachedActivity;
 use crate::types::ActivityType;
-use std::str::FromStr;
 
 // --- OAuth types ---
 
@@ -24,7 +23,7 @@ pub struct StravaActivity {
     pub athlete: StravaAthleteSummary,
     pub name: String,
     #[serde(rename = "type")]
-    pub activity_type: String,
+    pub activity_type: ActivityType,
     pub distance: f64,
     pub moving_time: i64,
     pub elapsed_time: i64,
@@ -164,8 +163,7 @@ pub fn to_cached(activity: &StravaActivity) -> CachedActivity {
         activity_id: activity.id,
         athlete_id: activity.athlete.id,
         title: activity.name.clone(),
-        activity_type: ActivityType::from_str(&activity.activity_type)
-            .unwrap_or(ActivityType::Other),
+        activity_type: activity.activity_type,
         distance_km: activity.distance / 1000.0,
         duration_s: activity.elapsed_time,
         pace_sec_per_km: pace,
@@ -186,7 +184,7 @@ mod tests {
             id: 123,
             athlete: StravaAthleteSummary { id: 456 },
             name: "Run".into(),
-            activity_type: "Run".into(),
+            activity_type: ActivityType::Run,
             distance: 10000.0, // 10 km
             moving_time: 3000, // 50 min = 3000 seconds
             elapsed_time: 3100,
@@ -209,7 +207,7 @@ mod tests {
             id: 1,
             athlete: StravaAthleteSummary { id: 1 },
             name: "Walk".into(),
-            activity_type: "Walk".into(),
+            activity_type: ActivityType::Walk,
             distance: 0.0,
             moving_time: 600,
             elapsed_time: 600,

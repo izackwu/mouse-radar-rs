@@ -1,8 +1,14 @@
+use serde::Deserialize;
 use std::fmt;
 use std::str::FromStr;
 
 /// Known Strava activity types with associated emoji, noun, and verb forms.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `#[serde(other)]` on the `Other` variant means any unknown activity type
+/// from the Strava API will deserialize as `ActivityType::Other` rather than
+/// producing an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "PascalCase")]
 pub enum ActivityType {
     Run,
     TrailRun,
@@ -12,6 +18,7 @@ pub enum ActivityType {
     Hike,
     Walk,
     Swim,
+    #[serde(other)]
     Other,
 }
 
