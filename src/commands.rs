@@ -308,19 +308,20 @@ async fn cmd_auth(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::float_cmp)]
     use super::*;
 
     #[test]
     fn test_admin_check_logic() {
         let config = Config {
             bot_admin_usernames: vec!["alice".into(), "bob".into()],
-            telegram_bot_token: "".into(),
-            telegram_chat_id: "".into(),
-            strava_client_id: "".into(),
-            strava_client_secret: "".into(),
+            telegram_bot_token: String::new(),
+            telegram_chat_id: String::new(),
+            strava_client_id: String::new(),
+            strava_client_secret: String::new(),
             poll_interval_seconds: 300,
             cold_start_lookback_days: 30,
-            database_path: "".into(),
+            database_path: String::new(),
             tracked_activity_types: vec![],
         };
 
