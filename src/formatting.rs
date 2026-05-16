@@ -27,7 +27,7 @@ pub fn format_activity_message(
             format_pace(pace),
             format_duration(duration_s),
         )),
-        None => msg.push_str(&format!("\n⏱ {}", format_duration(duration_s),)),
+        None => msg.push_str(&format!("\n⏱ {}", format_duration(duration_s))),
     }
 
     // Mileage stats
