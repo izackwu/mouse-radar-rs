@@ -1,5 +1,14 @@
 use crate::types::ActivityType;
 use anyhow::Result;
+use std::sync::LazyLock;
+
+static FONTS: LazyLock<std::sync::Arc<usvg::fontdb::Database>> = LazyLock::new(|| {
+    let mut db = usvg::fontdb::Database::new();
+    db.load_font_data(include_bytes!("../fonts/Inter-Regular.ttf").to_vec());
+    db.load_font_data(include_bytes!("../fonts/Inter-Bold.ttf").to_vec());
+    db.load_font_data(include_bytes!("../fonts/emoji-subset.ttf").to_vec());
+    std::sync::Arc::new(db)
+});
 
 const SVG_TEMPLATE: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="640" height="450" viewBox="0 0 640 450" text-rendering="optimizeLegibility">
   <rect width="640" height="450" fill="#ffffff" rx="0"/>
@@ -118,14 +127,10 @@ pub fn render_card(data: &CardData, scale: u32) -> Result<Vec<u8>> {
         ],
     );
 
-    let inter_regular = include_bytes!("../fonts/Inter-Regular.ttf");
-    let inter_bold = include_bytes!("../fonts/Inter-Bold.ttf");
-    let emoji_font = include_bytes!("../fonts/emoji-subset.ttf");
-
-    let mut opts = usvg::Options::default();
-    opts.fontdb_mut().load_font_data(inter_regular.to_vec());
-    opts.fontdb_mut().load_font_data(inter_bold.to_vec());
-    opts.fontdb_mut().load_font_data(emoji_font.to_vec());
+    let opts = usvg::Options {
+        fontdb: std::sync::Arc::clone(&FONTS),
+        ..Default::default()
+    };
 
     let tree = usvg::Tree::from_str(&svg, &opts)?;
 
