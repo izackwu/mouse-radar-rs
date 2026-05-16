@@ -5,6 +5,7 @@
 data/
 # AI
 docs/
+.claude/
 .superpowers/
 *.local.*
 # MacOS
