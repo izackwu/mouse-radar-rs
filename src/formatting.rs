@@ -1,3 +1,4 @@
+use crate::types::ActivityType;
 use chrono::Datelike;
 
 #[must_use]
@@ -5,7 +6,7 @@ use chrono::Datelike;
 pub fn format_activity_message(
     athlete_name: &str,
     _activity_title: &str,
-    activity_type: &str,
+    activity_type: ActivityType,
     distance_km: f64,
     pace_sec_per_km: Option<i64>,
     duration_s: i64,
@@ -15,8 +16,8 @@ pub fn format_activity_message(
     incomplete_week: bool,
     incomplete_month: bool,
 ) -> String {
-    let emoji = activity_emoji(activity_type);
-    let verb = activity_verb(activity_type);
+    let emoji = activity_type.emoji();
+    let verb = activity_type.verb_past();
 
     let mut msg = format!("{} {} {} {:.1} km", emoji, athlete_name, verb, distance_km);
 
@@ -70,17 +71,6 @@ pub fn format_pace(sec_per_km: i64) -> String {
     format!("{}:{:02}", minutes, seconds)
 }
 
-#[must_use]
-pub fn activity_emoji(activity_type: &str) -> &str {
-    match activity_type {
-        "Run" | "TrailRun" | "VirtualRun" => "🏃",
-        "Hike" => "🥾",
-        "Walk" => "🚶",
-        "Ride" => "🚴",
-        _ => "🏅",
-    }
-}
-
 /// Returns (`incomplete_week`, `incomplete_month`)
 #[must_use]
 pub fn incomplete_periods(oldest_date: Option<chrono::NaiveDate>) -> (bool, bool) {
@@ -98,17 +88,6 @@ pub fn incomplete_periods(oldest_date: Option<chrono::NaiveDate>) -> (bool, bool
         chrono::NaiveDate::from_ymd_opt(today.year(), today.month(), 1).expect("valid date");
 
     (oldest > monday, oldest > first_of_month)
-}
-
-fn activity_verb(activity_type: &str) -> &str {
-    match activity_type {
-        "Run" | "TrailRun" | "VirtualRun" => "ran",
-        "Hike" => "hiked",
-        "Walk" => "walked",
-        "Ride" | "VirtualRide" => "rode",
-        "Swim" => "swam",
-        _ => "logged",
-    }
 }
 
 #[cfg(test)]
@@ -143,13 +122,13 @@ mod tests {
 
     #[test]
     fn test_activity_emoji() {
-        assert_eq!(activity_emoji("Run"), "🏃");
-        assert_eq!(activity_emoji("TrailRun"), "🏃");
-        assert_eq!(activity_emoji("VirtualRun"), "🏃");
-        assert_eq!(activity_emoji("Hike"), "🥾");
-        assert_eq!(activity_emoji("Walk"), "🚶");
-        assert_eq!(activity_emoji("Ride"), "🚴");
-        assert_eq!(activity_emoji("Swim"), "🏅");
+        assert_eq!(ActivityType::Run.emoji(), "🏃");
+        assert_eq!(ActivityType::TrailRun.emoji(), "🏃");
+        assert_eq!(ActivityType::VirtualRun.emoji(), "🏃");
+        assert_eq!(ActivityType::Hike.emoji(), "🥾");
+        assert_eq!(ActivityType::Walk.emoji(), "🚶");
+        assert_eq!(ActivityType::Ride.emoji(), "🚴");
+        assert_eq!(ActivityType::Swim.emoji(), "🏅");
     }
 
     #[test]
@@ -172,7 +151,7 @@ mod tests {
         let msg = format_activity_message(
             "zack",
             "Afternoon Run",
-            "Run",
+            ActivityType::Run,
             10.2,
             Some(286), // 4:46 /km
             2982,      // 49:42
@@ -196,7 +175,7 @@ mod tests {
         let msg = format_activity_message(
             "bob",
             "Hill Climb",
-            "Hike",
+            ActivityType::Hike,
             5.0,
             None,
             3600,
@@ -217,7 +196,7 @@ mod tests {
         let msg = format_activity_message(
             "alice",
             "Run",
-            "Run",
+            ActivityType::Run,
             5.0,
             Some(300),
             1500,

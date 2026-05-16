@@ -1,4 +1,11 @@
-/target
+# Rust
+**/target
+# App data
 .env
 data/
+# AI
 docs/
+.superpowers/
+*.local.*
+# MacOS
+.DS_Store

@@ -1,4 +1,7 @@
 use std::env;
+use std::str::FromStr;
+
+use crate::types::ActivityType;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -10,7 +13,7 @@ pub struct Config {
     pub cold_start_lookback_days: i64,
     pub database_path: String,
     pub bot_admin_usernames: Vec<String>,
-    pub tracked_activity_types: Vec<String>,
+    pub tracked_activity_types: Vec<ActivityType>,
 }
 
 impl Config {
@@ -32,8 +35,8 @@ impl Config {
             tracked_activity_types: env::var("TRACKED_ACTIVITY_TYPES")
                 .unwrap_or_else(|_| "Run,TrailRun,VirtualRun,Hike,Walk".into())
                 .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
+                .map(|s| ActivityType::from_str(s.trim()).unwrap_or(ActivityType::Other))
+                .filter(|t| *t != ActivityType::Other)
                 .collect(),
         })
     }
@@ -76,7 +79,10 @@ mod tests {
         assert_eq!(cfg.cold_start_lookback_days, 30); // default
         assert_eq!(cfg.database_path, "/tmp/test.db");
         assert_eq!(cfg.bot_admin_usernames, vec!["alice", "bob"]);
-        assert_eq!(cfg.tracked_activity_types, vec!["Run", "Hike"]);
+        assert_eq!(
+            cfg.tracked_activity_types,
+            vec![ActivityType::Run, ActivityType::Hike]
+        );
     }
 
     #[test]
@@ -100,7 +106,13 @@ mod tests {
         assert!(cfg.bot_admin_usernames.is_empty());
         assert_eq!(
             cfg.tracked_activity_types,
-            vec!["Run", "TrailRun", "VirtualRun", "Hike", "Walk"]
+            vec![
+                ActivityType::Run,
+                ActivityType::TrailRun,
+                ActivityType::VirtualRun,
+                ActivityType::Hike,
+                ActivityType::Walk,
+            ]
         );
     }
 }
