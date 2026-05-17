@@ -70,6 +70,37 @@ pub fn truncate(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// Strip the two emoji presentation selectors (VS-15 U+FE0E, VS-16 U+FE0F) from text.
+///
+/// **What these selectors do:** Unicode reserves U+FE00..U+FE0F as variation selectors.
+/// VS-15 and VS-16 are the emoji-related pair:
+///   - **VS-16 (U+FE0F)** — "emoji presentation". Appended after a text-default codepoint
+///     like ☁ U+2601 to opt into the color emoji glyph. Most user-facing ☁️ ✈️ ⭐️ ⚠️ ❄️
+///     input is actually two codepoints: base + FE0F.
+///   - **VS-15 (U+FE0E)** — "text presentation". The opposite hint: render as the
+///     monochrome text glyph instead of the color emoji.
+///
+/// **Why we strip them:** usvg's font fallback fails to render a base+VS sequence even
+/// when the chosen face (e.g. Apple Color Emoji) has *both* codepoints in its cmap —
+/// the whole run drops to the renderer's "no glyph" rectangle. Stripping the selector
+/// lets the base codepoint flow through normal fallback, and our preloaded color-emoji
+/// font already biases the result toward the color variant, which is what users want
+/// in a Strava activity card.
+///
+/// **Why we don't strip the broader VS range:** the supplementary block U+E0100..U+E01EF
+/// (VS-17..VS-256) encodes Ideographic Variation Sequences for CJK — most notably the
+/// specific historical glyph for a Japanese family name's kanji (e.g. the variant of 邊
+/// in 渡邊). Stripping those would silently render the wrong glyph for that person. We
+/// haven't seen usvg break on those, so we leave them alone. VS-1..VS-14 and the
+/// Mongolian FVS block (U+180B..U+180D, U+180F) are similarly rare in our input domain
+/// and not stripped.
+#[must_use]
+pub fn strip_emoji_presentation_selectors(s: &str) -> String {
+    s.chars()
+        .filter(|&c| c != '\u{FE0E}' && c != '\u{FE0F}')
+        .collect()
+}
+
 /// Replace `{{TOKEN}}` placeholders in the template with values from `tokens`.
 #[must_use]
 pub fn fill_template(template: &str, tokens: &[(&str, &str)]) -> String {
@@ -150,9 +181,15 @@ pub fn render_card(data: &CardData, scale: u32) -> Result<Vec<u8>> {
         SVG_TEMPLATE,
         &[
             ("EMOJI", data.activity_type.emoji()),
-            ("NAME", &truncate(&data.athlete_name, 12)),
+            (
+                "NAME",
+                &truncate(&strip_emoji_presentation_selectors(&data.athlete_name), 12),
+            ),
             ("ACTIVITY_NOUN", data.activity_type.noun()),
-            ("TITLE", &truncate(&data.title, 40)),
+            (
+                "TITLE",
+                &truncate(&strip_emoji_presentation_selectors(&data.title), 40),
+            ),
             ("DATE", &date_str),
             ("TIME", &time_str),
             ("DISTANCE", &distance),
@@ -495,6 +532,23 @@ mod tests {
         };
         let png = render_card(&data, 4).expect("render cjk+emoji");
         fs::write(format!("{dir}/09-cjk-emoji.png"), &png).unwrap();
+
+        // Emoji presentation selectors VS-15 (U+FE0E) and VS-16 (U+FE0F).
+        //
+        // Text-default symbols like ☁ U+2601, ✈ U+2708, ⌚ U+231A take a trailing
+        // FE0F to render as color emoji. usvg's fallback drops the whole run to
+        // "no glyph" when it sees the base+VS sequence — see
+        // strip_emoji_presentation_selectors. This fixture sends both VS-15 and
+        // VS-16 through render_card to lock in that they get stripped and the
+        // base glyphs render normally.
+        let data = CardData {
+            activity_type: ActivityType::Run,
+            athlete_name: "Storm Chaser".into(),
+            title: "☁\u{FE0F} ✈\u{FE0F} ⌚\u{FE0E} 6 AM".into(),
+            ..default_card()
+        };
+        let png = render_card(&data, 4).expect("render variation selectors");
+        fs::write(format!("{dir}/10-variation-selectors.png"), &png).unwrap();
 
         // File size sanity
         for entry in fs::read_dir(dir).unwrap() {
