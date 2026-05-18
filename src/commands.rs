@@ -1,6 +1,11 @@
 use log::info;
 use std::sync::Arc;
-use teloxide::{prelude::*, types::InputFile, utils::command::BotCommands, RequestError};
+use teloxide::{
+    prelude::*,
+    types::{InputFile, ParseMode},
+    utils::command::BotCommands,
+    RequestError,
+};
 
 use crate::config::Config;
 use crate::db::{self, Db};
@@ -344,6 +349,7 @@ async fn cmd_latest(
             bot.send_message(msg.chat.id, notif.text).await?;
             bot.send_photo(msg.chat.id, InputFile::memory(notif.card_png))
                 .caption(notif.caption)
+                .parse_mode(ParseMode::MarkdownV2)
                 .await?;
         }
         Some((_, None)) => {
@@ -379,6 +385,7 @@ mod tests {
             cold_start_lookback_days: 30,
             database_path: String::new(),
             tracked_activity_types: vec![],
+            notification_mode: crate::config::NotificationMode::CardAndText,
         };
 
         assert!(config.bot_admin_usernames.iter().any(|a| a == "alice"));
