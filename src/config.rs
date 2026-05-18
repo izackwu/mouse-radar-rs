@@ -1,7 +1,17 @@
 use std::env;
 use std::str::FromStr;
 
+use strum::VariantNames;
+
 use crate::types::ActivityType;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::EnumString, strum::VariantNames)]
+#[strum(serialize_all = "snake_case", ascii_case_insensitive)]
+pub enum NotificationMode {
+    CardOnly,
+    TextOnly,
+    CardAndText,
+}
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -14,10 +24,26 @@ pub struct Config {
     pub database_path: String,
     pub bot_admin_usernames: Vec<String>,
     pub tracked_activity_types: Vec<ActivityType>,
+    pub notification_mode: NotificationMode,
 }
 
 impl Config {
-    pub fn from_env() -> Result<Self, env::VarError> {
+    pub fn from_env() -> anyhow::Result<Self> {
+        let notification_mode = match env::var("NOTIFICATION_MODE") {
+            Ok(v) => {
+                let normalized = v.trim().replace('-', "_");
+                NotificationMode::from_str(&normalized).map_err(|_| {
+                    anyhow::anyhow!(
+                        "invalid NOTIFICATION_MODE '{}' (expected one of: {})",
+                        v,
+                        NotificationMode::VARIANTS.join(", ")
+                    )
+                })?
+            }
+            Err(env::VarError::NotPresent) => NotificationMode::CardAndText,
+            Err(e) => return Err(e.into()),
+        };
+
         Ok(Self {
             telegram_bot_token: env::var("TELEGRAM_BOT_TOKEN")?,
             telegram_chat_id: env::var("TELEGRAM_CHAT_ID")?,
@@ -38,6 +64,7 @@ impl Config {
                 .map(|s| ActivityType::from_str(s.trim()).unwrap_or(ActivityType::Other))
                 .filter(|t| *t != ActivityType::Other)
                 .collect(),
+            notification_mode,
         })
     }
 }
@@ -68,6 +95,7 @@ mod tests {
         env::set_var("DATABASE_PATH", "/tmp/test.db");
         env::set_var("BOT_ADMIN_USERNAMES", "alice,bob");
         env::set_var("TRACKED_ACTIVITY_TYPES", "Run,Hike");
+        env::set_var("NOTIFICATION_MODE", "text_only");
 
         let cfg = Config::from_env().unwrap();
 
@@ -83,6 +111,7 @@ mod tests {
             cfg.tracked_activity_types,
             vec![ActivityType::Run, ActivityType::Hike]
         );
+        assert_eq!(cfg.notification_mode, NotificationMode::TextOnly);
     }
 
     #[test]
@@ -93,6 +122,7 @@ mod tests {
         env::remove_var("DATABASE_PATH");
         env::remove_var("COLD_START_LOOKBACK_DAYS");
         env::remove_var("TRACKED_ACTIVITY_TYPES");
+        env::remove_var("NOTIFICATION_MODE");
         env::set_var("TELEGRAM_BOT_TOKEN", "t");
         env::set_var("TELEGRAM_CHAT_ID", "c");
         env::set_var("STRAVA_CLIENT_ID", "id");
@@ -114,5 +144,59 @@ mod tests {
                 ActivityType::Walk,
             ]
         );
+        assert_eq!(cfg.notification_mode, NotificationMode::CardAndText);
+    }
+
+    #[test]
+    fn test_notification_mode_from_str() {
+        // strum-derived FromStr: snake_case, case-insensitive
+        assert_eq!(
+            NotificationMode::from_str("card_only").unwrap(),
+            NotificationMode::CardOnly
+        );
+        assert_eq!(
+            NotificationMode::from_str("TEXT_ONLY").unwrap(),
+            NotificationMode::TextOnly
+        );
+        assert_eq!(
+            NotificationMode::from_str("Card_And_Text").unwrap(),
+            NotificationMode::CardAndText
+        );
+        assert!(NotificationMode::from_str("bogus").is_err());
+    }
+
+    #[test]
+    fn test_from_env_accepts_hyphenated_and_whitespace() {
+        let _guard = CONFIG_LOCK.lock().unwrap();
+        env::set_var("TELEGRAM_BOT_TOKEN", "t");
+        env::set_var("TELEGRAM_CHAT_ID", "c");
+        env::set_var("STRAVA_CLIENT_ID", "id");
+        env::set_var("STRAVA_CLIENT_SECRET", "secret");
+        env::set_var("NOTIFICATION_MODE", "  Card-And-Text  ");
+
+        let cfg = Config::from_env().unwrap();
+        assert_eq!(cfg.notification_mode, NotificationMode::CardAndText);
+
+        env::remove_var("NOTIFICATION_MODE");
+    }
+
+    #[test]
+    fn test_invalid_notification_mode_fails() {
+        let _guard = CONFIG_LOCK.lock().unwrap();
+        env::set_var("TELEGRAM_BOT_TOKEN", "t");
+        env::set_var("TELEGRAM_CHAT_ID", "c");
+        env::set_var("STRAVA_CLIENT_ID", "id");
+        env::set_var("STRAVA_CLIENT_SECRET", "secret");
+        env::set_var("NOTIFICATION_MODE", "bogus");
+
+        let err = Config::from_env().unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("invalid NOTIFICATION_MODE"));
+        // Sanity-check that the error lists the valid variants
+        assert!(msg.contains("card_only"));
+        assert!(msg.contains("text_only"));
+        assert!(msg.contains("card_and_text"));
+
+        env::remove_var("NOTIFICATION_MODE");
     }
 }

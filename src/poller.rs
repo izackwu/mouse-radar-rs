@@ -4,11 +4,11 @@ use log::{error, info, warn};
 use std::sync::Arc;
 use std::time::Duration;
 use teloxide::prelude::*;
-use teloxide::types::InputFile;
+use teloxide::types::{InputFile, ParseMode};
 
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use crate::config::Config;
+use crate::config::{Config, NotificationMode};
 use crate::db::{self, CachedActivity, Db};
 use crate::strava::{to_cached, StravaApi};
 use crate::types::ActivityType;
@@ -136,7 +136,7 @@ pub async fn run_poll_loop(
 
 #[allow(clippy::too_many_arguments)]
 pub async fn process_athlete(
-    _config: &Config,
+    config: &Config,
     db: &Arc<Db>,
     strava: &Arc<dyn StravaApi>,
     bot: &Bot,
@@ -267,16 +267,34 @@ pub async fn process_athlete(
             })
             .await??;
 
-            if let Err(e) = bot.send_message(*chat_id, notif.text).await {
-                error!("Failed to send message for {}: {}", athlete.name, e);
+            let send_text = matches!(
+                config.notification_mode,
+                NotificationMode::TextOnly | NotificationMode::CardAndText
+            );
+            let send_card = matches!(
+                config.notification_mode,
+                NotificationMode::CardOnly | NotificationMode::CardAndText
+            );
+            let mut delivered = false;
+
+            if send_text {
+                match bot.send_message(*chat_id, notif.text).await {
+                    Ok(_) => delivered = true,
+                    Err(e) => error!("Failed to send message for {}: {}", athlete.name, e),
+                }
             }
-            if let Err(e) = bot
-                .send_photo(*chat_id, InputFile::memory(notif.card_png))
-                .caption(notif.caption)
-                .await
-            {
-                error!("Failed to send card photo for {}: {}", athlete.name, e);
-            } else {
+            if send_card {
+                match bot
+                    .send_photo(*chat_id, InputFile::memory(notif.card_png))
+                    .caption(notif.caption)
+                    .parse_mode(ParseMode::MarkdownV2)
+                    .await
+                {
+                    Ok(_) => delivered = true,
+                    Err(e) => error!("Failed to send card photo for {}: {}", athlete.name, e),
+                }
+            }
+            if delivered {
                 info!("Notified: {} - {}", athlete.name, cached.title);
             }
         }

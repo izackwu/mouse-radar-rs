@@ -46,6 +46,7 @@ COLD_START_LOOKBACK_DAYS=30
 DATABASE_PATH=./data/bot.db
 BOT_ADMIN_USERNAMES=<your_telegram_username>
 TRACKED_ACTIVITY_TYPES=Run,TrailRun,VirtualRun,Hike,Walk
+NOTIFICATION_MODE=card_and_text   # one of: card_only, text_only, card_and_text
 ```
 
 ### 3. Run

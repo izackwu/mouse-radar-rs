@@ -134,17 +134,15 @@ pub struct Notification {
     pub caption: String,
 }
 
-/// Format the caption that accompanies the card photo.
+/// Format the caption that accompanies the card photo. Output is Telegram
+/// `MarkdownV2`; callers must send with `ParseMode::MarkdownV2`.
 #[must_use]
-pub fn format_caption(url: &str, incomplete_week: bool, incomplete_month: bool) -> String {
-    let mut caption = url.to_string();
-    if incomplete_week {
-        caption.push_str("\n* Week stats may be incomplete");
-    }
-    if incomplete_month {
-        caption.push_str("\n* Month stats may be incomplete");
-    }
-    caption
+pub fn format_caption(url: &str) -> String {
+    debug_assert!(
+        !url.contains(')') && !url.contains('\\'),
+        "URL contains characters that would break MarkdownV2 link syntax: {url}"
+    );
+    format!("Check it out on [Strava]({url})")
 }
 
 /// Render an activity card SVG, returning PNG bytes at the given scale.
@@ -281,16 +279,12 @@ mod tests {
     }
 
     #[test]
-    fn test_format_caption_normal() {
-        let cap = format_caption("https://strava.com/activities/1", false, false);
-        assert_eq!(cap, "https://strava.com/activities/1");
-    }
-
-    #[test]
-    fn test_format_caption_incomplete() {
-        let cap = format_caption("https://strava.com/activities/1", true, true);
-        assert!(cap.contains("* Week stats may be incomplete"));
-        assert!(cap.contains("* Month stats may be incomplete"));
+    fn test_format_caption() {
+        let cap = format_caption("https://strava.com/activities/1");
+        assert_eq!(
+            cap,
+            "Check it out on [Strava](https://strava.com/activities/1)"
+        );
     }
 
     /// Renders a card, verifies PNG output is non-empty and starts with PNG magic bytes.
