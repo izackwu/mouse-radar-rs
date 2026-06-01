@@ -9,7 +9,58 @@ use teloxide::{
 
 use crate::config::Config;
 use crate::db::{self, Db};
-use crate::strava::TokenResponse;
+use crate::strava::{self, StravaClients, TokenResponse};
+use crate::types::Slot;
+
+/// Why slot resolution failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotError {
+    /// Both Strava app slots already have an athlete pinned to them.
+    BothFull,
+    /// Slot 1 is occupied and slot 2 isn't configured in the environment.
+    Slot1FullApp2NotConfigured,
+}
+
+impl std::fmt::Display for SlotError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BothFull => f.write_str("Both Strava app slots are full."),
+            Self::Slot1FullApp2NotConfigured => f.write_str(
+                "Slot 1 is full. Set STRAVA_CLIENT_ID_2 and STRAVA_CLIENT_SECRET_2 to enable slot 2.",
+            ),
+        }
+    }
+}
+
+/// Decide which Strava app slot a `/register` or `/auth` call should use.
+///
+/// If the athlete already exists, reuse their existing slot (re-authorization
+/// case). Otherwise fill the empty slot, preferring slot 1.
+pub fn resolve_slot(
+    conn: &rusqlite::Connection,
+    strava_id: i64,
+    config: &Config,
+) -> anyhow::Result<Result<Slot, SlotError>> {
+    if let Some(existing) = db::get_athlete(conn, strava_id)? {
+        return Ok(Ok(existing.strava_app_slot));
+    }
+
+    let athletes = db::list_athletes(conn)?;
+    let slot_1_taken = athletes.iter().any(|a| a.strava_app_slot == Slot::One);
+    let slot_2_taken = athletes.iter().any(|a| a.strava_app_slot == Slot::Two);
+
+    if !slot_1_taken {
+        return Ok(Ok(Slot::One));
+    }
+    // slot 1 is taken
+    if config.strava_apps.slot_2.is_none() {
+        return Ok(Err(SlotError::Slot1FullApp2NotConfigured));
+    }
+    if slot_2_taken {
+        return Ok(Err(SlotError::BothFull));
+    }
+    Ok(Ok(Slot::Two))
+}
 
 /// Convert a displayable error into a `RequestError` (for use in ? propagation).
 fn to_request_error(e: impl std::fmt::Display) -> RequestError {
@@ -37,6 +88,7 @@ pub enum Command {
 pub struct AppState {
     pub config: Config,
     pub db: Arc<Db>,
+    pub strava_clients: Arc<StravaClients>,
     pub poll_tx: tokio::sync::mpsc::UnboundedSender<crate::poller::PollCommand>,
 }
 
@@ -109,7 +161,12 @@ async fn cmd_list(bot: Bot, msg: Message, state: Arc<AppState>) -> ResponseResul
     } else {
         athletes
             .iter()
-            .map(|a| format!("• {} (Strava ID: {})", a.name, a.strava_id))
+            .map(|a| {
+                format!(
+                    "• {} (Strava ID: {}, app slot: {})",
+                    a.name, a.strava_id, a.strava_app_slot as u8,
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n")
     };
@@ -195,21 +252,63 @@ async fn cmd_register(
         return Ok(());
     }
 
+    let Ok(strava_id_int) = strava_id.parse::<i64>() else {
+        bot.send_message(msg.chat.id, "Invalid Strava ID — must be a number.")
+            .await?;
+        return Ok(());
+    };
+
+    let db = Arc::clone(&state.db);
+    let config = state.config.clone();
+    let slot_result = tokio::task::spawn_blocking(move || {
+        db.run(|conn| resolve_slot(conn, strava_id_int, &config))
+    })
+    .await
+    .map_err(|e| {
+        log::error!("DB join error: {}", e);
+        to_request_error(e)
+    })?
+    .map_err(|e| {
+        log::error!("DB error during slot resolution: {}", e);
+        to_request_error(e)
+    })?;
+
+    let slot = match slot_result {
+        Ok(slot) => slot,
+        Err(slot_err) => {
+            bot.send_message(msg.chat.id, slot_err.to_string()).await?;
+            return Ok(());
+        }
+    };
+
+    let app = match slot {
+        Slot::One => &state.config.strava_apps.slot_1,
+        Slot::Two => state
+            .config
+            .strava_apps
+            .slot_2
+            .as_ref()
+            .expect("resolve_slot returned Two ⇒ slot 2 is configured"),
+    };
+
     let auth_url = format!(
         "https://www.strava.com/oauth/authorize?client_id={}&redirect_uri=http://localhost&response_type=code&approval_prompt=force&scope=read,activity:read,activity:read_all",
-        state.config.strava_client_id
+        app.id
     );
 
     bot.send_message(
         msg.chat.id,
         format!(
-            "Send this link to the athlete (Strava ID: {}):\n\n{}\n\n\
+            "Send this link to the athlete (Strava ID: {}, Strava app slot: {}):\n\n{}\n\n\
              Once authorized, use:\n/auth {} {} <code>",
-            strava_id, auth_url, name, strava_id,
+            strava_id, slot as u8, auth_url, name, strava_id,
         ),
     )
     .await?;
-    info!("Registration link generated for {} ({})", name, strava_id);
+    info!(
+        "Registration link generated for {} ({}) → slot {}",
+        name, strava_id, slot as u8
+    );
     Ok(())
 }
 
@@ -235,36 +334,43 @@ async fn cmd_auth(
         return Ok(());
     };
 
-    // Exchange code for tokens
-    let http = reqwest::Client::new();
-    let resp = http
-        .post("https://www.strava.com/oauth/token")
-        .form(&[
-            ("client_id", state.config.strava_client_id.as_str()),
-            ("client_secret", state.config.strava_client_secret.as_str()),
-            ("code", code.as_str()),
-            ("grant_type", "authorization_code"),
-        ])
-        .send()
-        .await;
+    // Resolve which Strava app slot this athlete belongs to.
+    let db = Arc::clone(&state.db);
+    let config = state.config.clone();
+    let slot_result = tokio::task::spawn_blocking(move || {
+        db.run(|conn| resolve_slot(conn, strava_id_int, &config))
+    })
+    .await
+    .map_err(|e| {
+        log::error!("DB join error: {}", e);
+        to_request_error(e)
+    })?
+    .map_err(|e| {
+        log::error!("DB error during slot resolution: {}", e);
+        to_request_error(e)
+    })?;
 
-    let token: TokenResponse = match resp {
-        Ok(r) if r.status().is_success() => match r.json().await {
-            Ok(t) => t,
-            Err(e) => {
-                bot.send_message(msg.chat.id, format!("Failed to parse token: {}", e))
-                    .await?;
-                return Ok(());
-            }
-        },
-        Ok(r) => {
-            let body = r.text().await.unwrap_or_default();
-            bot.send_message(msg.chat.id, format!("Strava OAuth failed: {}", body))
+    let slot = match slot_result {
+        Ok(slot) => slot,
+        Err(slot_err) => {
+            bot.send_message(msg.chat.id, slot_err.to_string()).await?;
+            return Ok(());
+        }
+    };
+
+    let client = match strava::client_for_slot(&state.strava_clients, slot) {
+        Ok(c) => Arc::clone(c),
+        Err(e) => {
+            bot.send_message(msg.chat.id, format!("Strava app config error: {}", e))
                 .await?;
             return Ok(());
         }
+    };
+
+    let token: TokenResponse = match client.exchange_code(&code).await {
+        Ok(t) => t,
         Err(e) => {
-            bot.send_message(msg.chat.id, format!("Request error: {}", e))
+            bot.send_message(msg.chat.id, format!("Strava OAuth failed: {}", e))
                 .await?;
             return Ok(());
         }
@@ -278,7 +384,7 @@ async fn cmd_auth(
     let exp = token.expires_at;
 
     tokio::task::spawn_blocking(move || {
-        db.run(|conn| db::insert_athlete(conn, strava_id_int, &n, &acc, &refr, exp))
+        db.run(|conn| db::insert_athlete(conn, strava_id_int, &n, &acc, &refr, exp, slot))
     })
     .await
     .map_err(|e| {
@@ -379,8 +485,13 @@ mod tests {
             bot_admin_usernames: vec!["alice".into(), "bob".into()],
             telegram_bot_token: String::new(),
             telegram_chat_id: String::new(),
-            strava_client_id: String::new(),
-            strava_client_secret: String::new(),
+            strava_apps: crate::config::StravaApps {
+                slot_1: crate::config::StravaApp {
+                    id: String::new(),
+                    secret: String::new(),
+                },
+                slot_2: None,
+            },
             poll_interval_seconds: 300,
             cold_start_lookback_days: 30,
             database_path: String::new(),
@@ -391,5 +502,100 @@ mod tests {
         assert!(config.bot_admin_usernames.iter().any(|a| a == "alice"));
         assert!(config.bot_admin_usernames.iter().any(|a| a == "bob"));
         assert!(!config.bot_admin_usernames.iter().any(|a| a == "charlie"));
+    }
+
+    fn dummy_config(slot_2_configured: bool) -> Config {
+        Config {
+            bot_admin_usernames: vec![],
+            telegram_bot_token: String::new(),
+            telegram_chat_id: String::new(),
+            strava_apps: crate::config::StravaApps {
+                slot_1: crate::config::StravaApp {
+                    id: "id1".into(),
+                    secret: "sec1".into(),
+                },
+                slot_2: slot_2_configured.then(|| crate::config::StravaApp {
+                    id: "id2".into(),
+                    secret: "sec2".into(),
+                }),
+            },
+            poll_interval_seconds: 300,
+            cold_start_lookback_days: 30,
+            database_path: String::new(),
+            tracked_activity_types: vec![],
+            notification_mode: crate::config::NotificationMode::CardAndText,
+        }
+    }
+
+    fn open_test_db() -> Db {
+        let dir = tempfile::tempdir().unwrap();
+        Db::open(dir.path().join("test.db").to_str().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn resolve_slot_empty_db_returns_one() {
+        let db = open_test_db();
+        let cfg = dummy_config(true);
+        db.run(|conn| {
+            let slot = resolve_slot(conn, 111, &cfg).unwrap().unwrap();
+            assert_eq!(slot, Slot::One);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn resolve_slot_one_taken_returns_two() {
+        let db = open_test_db();
+        let cfg = dummy_config(true);
+        db.run(|conn| {
+            db::insert_athlete(conn, 1, "alice", "a", "r", 0, Slot::One).unwrap();
+            let slot = resolve_slot(conn, 222, &cfg).unwrap().unwrap();
+            assert_eq!(slot, Slot::Two);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn resolve_slot_one_taken_app2_unconfigured_errors() {
+        let db = open_test_db();
+        let cfg = dummy_config(false);
+        db.run(|conn| {
+            db::insert_athlete(conn, 1, "alice", "a", "r", 0, Slot::One).unwrap();
+            let err = resolve_slot(conn, 222, &cfg).unwrap().unwrap_err();
+            assert_eq!(err, SlotError::Slot1FullApp2NotConfigured);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn resolve_slot_both_taken_errors() {
+        let db = open_test_db();
+        let cfg = dummy_config(true);
+        db.run(|conn| {
+            db::insert_athlete(conn, 1, "alice", "a", "r", 0, Slot::One).unwrap();
+            db::insert_athlete(conn, 2, "bob", "a", "r", 0, Slot::Two).unwrap();
+            let err = resolve_slot(conn, 333, &cfg).unwrap().unwrap_err();
+            assert_eq!(err, SlotError::BothFull);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn resolve_slot_reuses_existing_athlete_slot() {
+        let db = open_test_db();
+        let cfg = dummy_config(true);
+        db.run(|conn| {
+            db::insert_athlete(conn, 1, "alice", "a", "r", 0, Slot::One).unwrap();
+            db::insert_athlete(conn, 2, "bob", "a", "r", 0, Slot::Two).unwrap();
+            // Re-auth for bob → keep his slot 2 even though both are full.
+            let slot = resolve_slot(conn, 2, &cfg).unwrap().unwrap();
+            assert_eq!(slot, Slot::Two);
+            Ok(())
+        })
+        .unwrap();
     }
 }

@@ -4,7 +4,7 @@ use rusqlite::Connection;
 use std::path::Path;
 use std::sync::Mutex;
 
-use crate::types::ActivityType;
+use crate::types::{ActivityType, Slot};
 use std::str::FromStr;
 
 pub struct Db {
@@ -91,12 +91,13 @@ impl Db {
 pub fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS athletes (
-            strava_id     INTEGER PRIMARY KEY,
-            name          TEXT NOT NULL,
-            access_token  TEXT NOT NULL,
-            refresh_token TEXT NOT NULL,
-            token_expires INTEGER NOT NULL,
-            added_at      INTEGER NOT NULL DEFAULT (unixepoch())
+            strava_id       INTEGER PRIMARY KEY,
+            name            TEXT NOT NULL,
+            access_token    TEXT NOT NULL,
+            refresh_token   TEXT NOT NULL,
+            token_expires   INTEGER NOT NULL,
+            added_at        INTEGER NOT NULL DEFAULT (unixepoch()),
+            strava_app_slot INTEGER NOT NULL DEFAULT 1
         );
 
         CREATE TABLE IF NOT EXISTS seen_activities (
@@ -118,6 +119,21 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             cached_at       INTEGER NOT NULL DEFAULT (unixepoch())
         );",
     )?;
+
+    // Additive migration for the multi-Strava-clients workaround:
+    // older DBs were created without strava_app_slot. Existing athletes
+    // default to slot 1 (correct — they were issued by the only Strava app).
+    let has_col: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('athletes') WHERE name = 'strava_app_slot'",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_col == 0 {
+        conn.execute_batch(
+            "ALTER TABLE athletes ADD COLUMN strava_app_slot INTEGER NOT NULL DEFAULT 1;",
+        )?;
+    }
+
     Ok(())
 }
 
@@ -129,6 +145,7 @@ pub struct Athlete {
     pub refresh_token: String,
     pub token_expires: i64,
     pub added_at: i64,
+    pub strava_app_slot: Slot,
 }
 
 pub fn insert_athlete(
@@ -138,30 +155,52 @@ pub fn insert_athlete(
     access_token: &str,
     refresh_token: &str,
     token_expires: i64,
+    strava_app_slot: Slot,
 ) -> Result<()> {
     conn.execute(
-        "INSERT INTO athletes (strava_id, name, access_token, refresh_token, token_expires)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        rusqlite::params![strava_id, name, access_token, refresh_token, token_expires],
+        "INSERT INTO athletes
+            (strava_id, name, access_token, refresh_token, token_expires, strava_app_slot)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![
+            strava_id,
+            name,
+            access_token,
+            refresh_token,
+            token_expires,
+            strava_app_slot as i64,
+        ],
     )?;
     Ok(())
 }
 
+/// Row mapper for the standard athlete `SELECT` columns
+/// (`strava_id`, `name`, `access_token`, `refresh_token`, `token_expires`, `added_at`, `strava_app_slot`).
+fn row_to_athlete(row: &rusqlite::Row) -> rusqlite::Result<Athlete> {
+    let slot_int: i64 = row.get(6)?;
+    let strava_app_slot = Slot::try_from(slot_int).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            6,
+            rusqlite::types::Type::Integer,
+            Box::new(std::io::Error::other(e.to_string())),
+        )
+    })?;
+    Ok(Athlete {
+        strava_id: row.get(0)?,
+        name: row.get(1)?,
+        access_token: row.get(2)?,
+        refresh_token: row.get(3)?,
+        token_expires: row.get(4)?,
+        added_at: row.get(5)?,
+        strava_app_slot,
+    })
+}
+
 pub fn get_athlete(conn: &Connection, strava_id: i64) -> Result<Option<Athlete>> {
     let mut stmt = conn.prepare(
-        "SELECT strava_id, name, access_token, refresh_token, token_expires, added_at
+        "SELECT strava_id, name, access_token, refresh_token, token_expires, added_at, strava_app_slot
          FROM athletes WHERE strava_id = ?1",
     )?;
-    let mut rows = stmt.query_map(rusqlite::params![strava_id], |row| {
-        Ok(Athlete {
-            strava_id: row.get(0)?,
-            name: row.get(1)?,
-            access_token: row.get(2)?,
-            refresh_token: row.get(3)?,
-            token_expires: row.get(4)?,
-            added_at: row.get(5)?,
-        })
-    })?;
+    let mut rows = stmt.query_map(rusqlite::params![strava_id], row_to_athlete)?;
     match rows.next() {
         Some(result) => Ok(Some(result?)),
         None => Ok(None),
@@ -170,19 +209,10 @@ pub fn get_athlete(conn: &Connection, strava_id: i64) -> Result<Option<Athlete>>
 
 pub fn list_athletes(conn: &Connection) -> Result<Vec<Athlete>> {
     let mut stmt = conn.prepare(
-        "SELECT strava_id, name, access_token, refresh_token, token_expires, added_at
+        "SELECT strava_id, name, access_token, refresh_token, token_expires, added_at, strava_app_slot
          FROM athletes ORDER BY added_at",
     )?;
-    let rows = stmt.query_map([], |row| {
-        Ok(Athlete {
-            strava_id: row.get(0)?,
-            name: row.get(1)?,
-            access_token: row.get(2)?,
-            refresh_token: row.get(3)?,
-            token_expires: row.get(4)?,
-            added_at: row.get(5)?,
-        })
-    })?;
+    let rows = stmt.query_map([], row_to_athlete)?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Into::into)
 }
@@ -424,7 +454,16 @@ mod tests {
         let db = test_db();
 
         db.run(|conn| {
-            insert_athlete(conn, 12345, "alice", "acc_tok", "ref_tok", 1_710_000_000).unwrap();
+            insert_athlete(
+                conn,
+                12345,
+                "alice",
+                "acc_tok",
+                "ref_tok",
+                1_710_000_000,
+                Slot::One,
+            )
+            .unwrap();
 
             let a = get_athlete(conn, 12345).unwrap().unwrap();
             assert_eq!(a.strava_id, 12345);
@@ -432,9 +471,63 @@ mod tests {
             assert_eq!(a.access_token, "acc_tok");
             assert_eq!(a.refresh_token, "ref_tok");
             assert_eq!(a.token_expires, 1_710_000_000);
+            assert_eq!(a.strava_app_slot, Slot::One);
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn test_insert_athlete_slot_two_round_trip() {
+        let db = test_db();
+        db.run(|conn| {
+            insert_athlete(conn, 42, "bob", "a", "r", 0, Slot::Two).unwrap();
+            let a = get_athlete(conn, 42).unwrap().unwrap();
+            assert_eq!(a.strava_app_slot, Slot::Two);
+
+            let list = list_athletes(conn).unwrap();
+            assert_eq!(list[0].strava_app_slot, Slot::Two);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn test_migration_adds_slot_column_to_existing_db() {
+        // Simulate an old DB created without the strava_app_slot column,
+        // then run init_schema and verify the column exists and existing
+        // rows default to slot 1.
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("old.db");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            // Pre-migration schema (no strava_app_slot column).
+            conn.execute_batch(
+                "CREATE TABLE athletes (
+                    strava_id     INTEGER PRIMARY KEY,
+                    name          TEXT NOT NULL,
+                    access_token  TEXT NOT NULL,
+                    refresh_token TEXT NOT NULL,
+                    token_expires INTEGER NOT NULL,
+                    added_at      INTEGER NOT NULL DEFAULT (unixepoch())
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO athletes (strava_id, name, access_token, refresh_token, token_expires)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![999, "legacy", "acc", "ref", 0],
+            )
+            .unwrap();
+        }
+
+        // Re-open via Db::open to trigger init_schema's migration.
+        let db = Db::open(db_path.to_str().unwrap()).unwrap();
+        let athlete = db
+            .run(|conn| get_athlete(conn, 999))
+            .unwrap()
+            .expect("legacy athlete should still exist");
+        assert_eq!(athlete.strava_app_slot, Slot::One);
     }
 
     #[test]
@@ -442,8 +535,8 @@ mod tests {
         let db = test_db();
 
         db.run(|conn| {
-            insert_athlete(conn, 1, "alice", "a", "r", 0).unwrap();
-            insert_athlete(conn, 2, "bob", "a", "r", 0).unwrap();
+            insert_athlete(conn, 1, "alice", "a", "r", 0, Slot::One).unwrap();
+            insert_athlete(conn, 2, "bob", "a", "r", 0, Slot::One).unwrap();
 
             let list = list_athletes(conn).unwrap();
             assert_eq!(list.len(), 2);
@@ -459,7 +552,7 @@ mod tests {
         let db = test_db();
 
         db.run(|conn| {
-            insert_athlete(conn, 1, "alice", "old_acc", "old_ref", 100).unwrap();
+            insert_athlete(conn, 1, "alice", "old_acc", "old_ref", 100, Slot::One).unwrap();
             update_athlete_tokens(conn, 1, "new_acc", "new_ref", 200).unwrap();
 
             let a = get_athlete(conn, 1).unwrap().unwrap();
@@ -488,7 +581,7 @@ mod tests {
         let db = test_db();
 
         db.run(|conn| {
-            insert_athlete(conn, 1, "alice", "a", "r", 0).unwrap();
+            insert_athlete(conn, 1, "alice", "a", "r", 0, Slot::One).unwrap();
 
             assert!(!is_activity_seen(conn, 100).unwrap());
             mark_activity_seen(conn, 100, 1).unwrap();
@@ -503,7 +596,7 @@ mod tests {
         let db = test_db();
 
         db.run(|conn| {
-            insert_athlete(conn, 1, "alice", "a", "r", 0).unwrap();
+            insert_athlete(conn, 1, "alice", "a", "r", 0, Slot::One).unwrap();
 
             bulk_mark_seen(conn, &[(101, 1), (102, 1), (103, 1)]).unwrap();
             assert!(is_activity_seen(conn, 101).unwrap());
@@ -519,7 +612,7 @@ mod tests {
         let db = test_db();
 
         db.run(|conn| {
-            insert_athlete(conn, 1, "alice", "a", "r", 0).unwrap();
+            insert_athlete(conn, 1, "alice", "a", "r", 0, Slot::One).unwrap();
 
             let act = CachedActivity {
                 activity_id: 200,
@@ -547,7 +640,7 @@ mod tests {
         let db = test_db();
 
         db.run(|conn| {
-            insert_athlete(conn, 1, "alice", "a", "r", 0).unwrap();
+            insert_athlete(conn, 1, "alice", "a", "r", 0, Slot::One).unwrap();
 
             // Use fixed dates within the same week/month
             let date1 = "2026-05-14T08:00:00"; // Thursday
@@ -607,7 +700,7 @@ mod tests {
         // Activity at 23:00 Sunday local time — counts for the week ending that Sunday
         let db = test_db();
         db.run(|conn| {
-            insert_athlete(conn, 1, "alice", "a", "r", 0).unwrap();
+            insert_athlete(conn, 1, "alice", "a", "r", 0, Slot::One).unwrap();
 
             cache_activity(
                 conn,
@@ -642,7 +735,7 @@ mod tests {
         // Activity at 00:01 Monday local time — counts for the new week
         let db = test_db();
         db.run(|conn| {
-            insert_athlete(conn, 1, "alice", "a", "r", 0).unwrap();
+            insert_athlete(conn, 1, "alice", "a", "r", 0, Slot::One).unwrap();
 
             cache_activity(
                 conn,
@@ -677,7 +770,7 @@ mod tests {
         // Month-end: May 31 vs Jun 1
         let db = test_db();
         db.run(|conn| {
-            insert_athlete(conn, 1, "alice", "a", "r", 0).unwrap();
+            insert_athlete(conn, 1, "alice", "a", "r", 0, Slot::One).unwrap();
 
             cache_activity(
                 conn,
@@ -727,7 +820,7 @@ mod tests {
         // `date(start_date_local)` extracts only the date part, ignoring time
         let db = test_db();
         db.run(|conn| {
-            insert_athlete(conn, 1, "alice", "a", "r", 0).unwrap();
+            insert_athlete(conn, 1, "alice", "a", "r", 0, Slot::One).unwrap();
 
             // Same date, different times — should all be included
             for (time_str, activity_id_val) in [
@@ -784,7 +877,7 @@ mod tests {
         let db = test_db();
 
         db.run(|conn| {
-            insert_athlete(conn, 1, "alice", "a", "r", 0).unwrap();
+            insert_athlete(conn, 1, "alice", "a", "r", 0, Slot::One).unwrap();
 
             assert!(get_last_activity_date(conn, 1).unwrap().is_none());
             assert!(get_oldest_activity_date(conn, 1).unwrap().is_none());
@@ -838,7 +931,7 @@ mod tests {
         let db = test_db();
 
         db.run(|conn| {
-            insert_athlete(conn, 1, "alice", "a", "r", 0).unwrap();
+            insert_athlete(conn, 1, "alice", "a", "r", 0, Slot::One).unwrap();
 
             let today = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
