@@ -41,6 +41,11 @@ TELEGRAM_BOT_TOKEN=<from @BotFather>
 TELEGRAM_CHAT_ID=<group chat ID>
 STRAVA_CLIENT_ID=<from Strava API settings>
 STRAVA_CLIENT_SECRET=<from Strava API settings>
+# Optional second Strava app — temporary workaround for Strava's
+# 1-athlete-per-app default cap. See docs/superpowers/specs/
+# 2026-06-01-multi-strava-clients-design.md for the full design and revert plan.
+# STRAVA_CLIENT_ID_2=<from a second Strava API app>
+# STRAVA_CLIENT_SECRET_2=<from a second Strava API app>
 POLL_INTERVAL_SECONDS=300
 COLD_START_LOOKBACK_DAYS=30
 DATABASE_PATH=./data/bot.db
@@ -48,6 +53,10 @@ BOT_ADMIN_USERNAMES=<your_telegram_username>
 TRACKED_ACTIVITY_TYPES=Run,TrailRun,VirtualRun,Hike,Walk
 NOTIFICATION_MODE=card_and_text   # one of: card_only, text_only, card_and_text
 ```
+
+### Multiple Strava apps (workaround)
+
+Strava limits new API apps to 1 authorized athlete by default. To onboard a second athlete without waiting for a quota increase, create a second Strava app and set `STRAVA_CLIENT_ID_2` / `STRAVA_CLIENT_SECRET_2`. The bot pins each athlete to a slot at registration time — slot 1 (the first/required app) fills first, then slot 2. `/list` shows each athlete's slot, and `/register` tells you which one the OAuth link is for.
 
 ### 3. Run
 
