@@ -10,7 +10,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::config::{Config, NotificationMode};
 use crate::db::{self, CachedActivity, Db};
-use crate::strava::{self, to_cached, StravaClients};
+use crate::strava::{to_cached, StravaApi};
 use crate::types::ActivityType;
 
 pub enum PollCommand {
@@ -22,7 +22,7 @@ pub enum PollCommand {
 pub async fn run_poll_cycle(
     config: &Config,
     db: &Arc<Db>,
-    strava_clients: &Arc<StravaClients>,
+    strava: &Arc<dyn StravaApi>,
     bot: &Bot,
 ) -> Result<()> {
     let chat_id: ChatId = ChatId(config.telegram_chat_id.parse()?);
@@ -40,14 +40,7 @@ pub async fn run_poll_cycle(
 
     for athlete in &athletes {
         if let Err(e) = process_athlete(
-            config,
-            db,
-            strava_clients,
-            bot,
-            &chat_id,
-            athlete,
-            &tracked,
-            lookback,
+            config, db, strava, bot, &chat_id, athlete, &tracked, lookback,
         )
         .await
         {
@@ -68,7 +61,7 @@ pub async fn run_poll_cycle(
 pub async fn run_poll_loop(
     config: Config,
     db: Arc<Db>,
-    strava_clients: Arc<StravaClients>,
+    strava: Arc<dyn StravaApi>,
     bot: Bot,
     mut rx: UnboundedReceiver<PollCommand>,
 ) {
@@ -91,7 +84,7 @@ pub async fn run_poll_loop(
         tokio::select! {
             _ = interval.tick() => {
                 info!("Starting poll cycle...");
-                if let Err(e) = run_poll_cycle(&config, &db, &strava_clients, &bot).await {
+                if let Err(e) = run_poll_cycle(&config, &db, &strava, &bot).await {
                     error!("Poll cycle failed: {}", e);
                 }
             }
@@ -99,7 +92,7 @@ pub async fn run_poll_loop(
                 match cmd {
                     PollCommand::PollAll => {
                         info!("Starting poll cycle (triggered)...");
-                        if let Err(e) = run_poll_cycle(&config, &db, &strava_clients, &bot).await {
+                        if let Err(e) = run_poll_cycle(&config, &db, &strava, &bot).await {
                             error!("Poll cycle failed: {}", e);
                         }
                     }
@@ -127,7 +120,7 @@ pub async fn run_poll_loop(
                             }
                         };
                         if let Err(e) = process_athlete(
-                            &config, &db, &strava_clients, &bot, &chat_id,
+                            &config, &db, &strava, &bot, &chat_id,
                             &athlete, &tracked, lookback,
                         ).await {
                             error!("Cold start for {} failed: {}", athlete.name, e);
@@ -145,27 +138,13 @@ pub async fn run_poll_loop(
 pub async fn process_athlete(
     config: &Config,
     db: &Arc<Db>,
-    strava_clients: &Arc<StravaClients>,
+    strava: &Arc<dyn StravaApi>,
     bot: &Bot,
     chat_id: &ChatId,
     athlete: &db::Athlete,
     tracked_types: &[ActivityType],
     lookback: chrono::Duration,
 ) -> Result<()> {
-    // Look up the Strava client for this athlete's app slot. If slot 2 was
-    // configured at the time of registration but the env var is now gone,
-    // skip rather than crash.
-    let strava = match strava::client_for_slot(strava_clients, athlete.strava_app_slot) {
-        Ok(c) => c,
-        Err(e) => {
-            warn!(
-                "No Strava client for {} (slot {}): {}. Skipping.",
-                athlete.name, athlete.strava_app_slot as u8, e
-            );
-            return Ok(());
-        }
-    };
-
     // 1. Refresh token if expiring within 1 hour
     let now = Utc::now().timestamp();
     let mut access_token = athlete.access_token.clone();

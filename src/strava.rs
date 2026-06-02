@@ -1,11 +1,9 @@
-use std::sync::Arc;
-
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::Deserialize;
 
 use crate::db::CachedActivity;
-use crate::types::{ActivityType, Slot};
+use crate::types::ActivityType;
 
 // --- OAuth types ---
 
@@ -149,29 +147,6 @@ impl StravaApi for StravaClient {
     }
 }
 
-// --- Slot-keyed collection of Strava clients ---
-
-/// Holds one Strava client per configured app slot. Mirrors `StravaApps`:
-/// slot 1 is always present, slot 2 is `Some` only when the workaround is
-/// enabled. Use `client_for_slot` to look up the right client for an athlete.
-pub struct StravaClients {
-    pub slot_1: Arc<dyn StravaApi>,
-    pub slot_2: Option<Arc<dyn StravaApi>>,
-}
-
-/// Look up the Strava client for a given slot. Returns an error if `slot_2`
-/// is requested but not configured (e.g., an athlete is pinned to slot 2 but
-/// the admin removed `STRAVA_CLIENT_ID_2`/`STRAVA_CLIENT_SECRET_2`).
-pub fn client_for_slot(clients: &StravaClients, slot: Slot) -> Result<&Arc<dyn StravaApi>> {
-    match slot {
-        Slot::One => Ok(&clients.slot_1),
-        Slot::Two => clients
-            .slot_2
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Strava app slot 2 is not configured")),
-    }
-}
-
 // --- Helper to convert StravaActivity -> CachedActivity ---
 
 #[must_use]
@@ -225,60 +200,6 @@ mod tests {
         // pace: 3000 sec / 10 km = 300 sec/km
         assert_eq!(cached.pace_sec_per_km, Some(300));
         assert_eq!(cached.url, "https://www.strava.com/activities/123");
-    }
-
-    /// A no-op `StravaApi` used only to build identifiable `StravaClients`
-    /// in lookup tests. Methods are unreachable.
-    struct DummyClient {
-        tag: &'static str,
-    }
-    #[async_trait]
-    impl StravaApi for DummyClient {
-        async fn exchange_code(&self, _code: &str) -> Result<TokenResponse> {
-            unreachable!("dummy: {}", self.tag)
-        }
-        async fn refresh_token(&self, _refresh_token: &str) -> Result<TokenResponse> {
-            unreachable!("dummy: {}", self.tag)
-        }
-        async fn get_activities(
-            &self,
-            _access_token: &str,
-            _after: Option<i64>,
-            _before: Option<i64>,
-            _per_page: u32,
-        ) -> Result<Vec<StravaActivity>> {
-            unreachable!("dummy: {}", self.tag)
-        }
-    }
-
-    #[test]
-    fn test_client_for_slot_one_always_ok() {
-        let clients = StravaClients {
-            slot_1: Arc::new(DummyClient { tag: "one" }),
-            slot_2: None,
-        };
-        assert!(client_for_slot(&clients, Slot::One).is_ok());
-    }
-
-    #[test]
-    fn test_client_for_slot_two_errs_when_not_configured() {
-        let clients = StravaClients {
-            slot_1: Arc::new(DummyClient { tag: "one" }),
-            slot_2: None,
-        };
-        match client_for_slot(&clients, Slot::Two) {
-            Ok(_) => panic!("expected error when slot 2 not configured"),
-            Err(e) => assert!(e.to_string().contains("slot 2")),
-        }
-    }
-
-    #[test]
-    fn test_client_for_slot_two_ok_when_configured() {
-        let clients = StravaClients {
-            slot_1: Arc::new(DummyClient { tag: "one" }),
-            slot_2: Some(Arc::new(DummyClient { tag: "two" })),
-        };
-        assert!(client_for_slot(&clients, Slot::Two).is_ok());
     }
 
     #[test]
