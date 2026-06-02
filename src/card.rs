@@ -142,7 +142,7 @@ pub fn format_caption(athlete_name: &str, url: &str) -> String {
         !url.contains(')') && !url.contains('\\'),
         "URL contains characters that would break MarkdownV2 link syntax: {url}"
     );
-    format!("{athlete_name} just finished a workout! Check it out on [Strava]({url})")
+    format!("{athlete_name} just finished a workout\\! Check it out on [Strava]({url})")
 }
 
 /// Render an activity card SVG, returning PNG bytes at the given scale.
