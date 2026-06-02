@@ -283,7 +283,7 @@ mod tests {
         let cap = format_caption("Randy", "https://strava.com/activities/1");
         assert_eq!(
             cap,
-            "Randy just finished a workout! Check it out on [Strava](https://strava.com/activities/1)"
+            "Randy just finished a workout\\! Check it out on [Strava](https://strava.com/activities/1)"
         );
     }
 
