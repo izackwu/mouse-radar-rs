@@ -25,19 +25,11 @@ async fn main() -> anyhow::Result<()> {
     let db = Arc::new(db::Db::open(&config.database_path)?);
     info!("Database opened at {}", config.database_path);
 
-    // Create one Strava client per configured app slot.
-    let strava_clients = Arc::new(strava::StravaClients {
-        slot_1: Arc::new(strava::StravaClient::new(
-            config.strava_apps.slot_1.id.clone(),
-            config.strava_apps.slot_1.secret.clone(),
-        )),
-        slot_2: config.strava_apps.slot_2.as_ref().map(|app| {
-            Arc::new(strava::StravaClient::new(
-                app.id.clone(),
-                app.secret.clone(),
-            )) as Arc<dyn strava::StravaApi>
-        }),
-    });
+    // Create Strava client
+    let strava_client: Arc<dyn strava::StravaApi> = Arc::new(strava::StravaClient::new(
+        config.strava_client_id.clone(),
+        config.strava_client_secret.clone(),
+    ));
 
     // Build Telegram bot
     let bot = Bot::new(config.telegram_bot_token.clone());
@@ -49,7 +41,6 @@ async fn main() -> anyhow::Result<()> {
     let app_state = Arc::new(commands::AppState {
         config: config.clone(),
         db: Arc::clone(&db),
-        strava_clients: Arc::clone(&strava_clients),
         poll_tx,
     });
 
@@ -73,7 +64,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(poller::run_poll_loop(
         config.clone(),
         Arc::clone(&db),
-        strava_clients,
+        strava_client,
         bot.clone(),
         poll_rx,
     ));
