@@ -78,7 +78,7 @@ impl Db {
             };
 
             let card_png = crate::card::render_card(&card_data, 4)?;
-            let caption = crate::card::format_caption(&activity.url);
+            let caption = crate::card::format_caption(athlete_name, &activity.url);
             Ok(crate::card::Notification {
                 text,
                 card_png,

@@ -137,12 +137,12 @@ pub struct Notification {
 /// Format the caption that accompanies the card photo. Output is Telegram
 /// `MarkdownV2`; callers must send with `ParseMode::MarkdownV2`.
 #[must_use]
-pub fn format_caption(url: &str) -> String {
+pub fn format_caption(athlete_name: &str, url: &str) -> String {
     debug_assert!(
         !url.contains(')') && !url.contains('\\'),
         "URL contains characters that would break MarkdownV2 link syntax: {url}"
     );
-    format!("Check it out on [Strava]({url})")
+    format!("{athlete_name} just finished a workout! Check it out on [Strava]({url})")
 }
 
 /// Render an activity card SVG, returning PNG bytes at the given scale.
@@ -280,10 +280,10 @@ mod tests {
 
     #[test]
     fn test_format_caption() {
-        let cap = format_caption("https://strava.com/activities/1");
+        let cap = format_caption("Randy", "https://strava.com/activities/1");
         assert_eq!(
             cap,
-            "Check it out on [Strava](https://strava.com/activities/1)"
+            "Randy just finished a workout! Check it out on [Strava](https://strava.com/activities/1)"
         );
     }
 
