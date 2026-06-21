@@ -22,6 +22,7 @@ impl Db {
              PRAGMA foreign_keys=ON;",
         )?;
         init_schema(&conn)?;
+        migrate_schema(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -114,11 +115,32 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             duration_s      INTEGER,
             pace_sec_per_km INTEGER,
             start_date_local TEXT,     -- ISO 8601 datetime in athlete's local timezone
+            start_date       TEXT,     -- ISO 8601 datetime in true UTC (Strava's start_date)
             url             TEXT,
             cached_at       INTEGER NOT NULL DEFAULT (unixepoch())
         );",
     )?;
     Ok(())
+}
+
+/// Idempotent migrations for databases created before a column existed.
+pub fn migrate_schema(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "activity_cache", "start_date")? {
+        conn.execute_batch("ALTER TABLE activity_cache ADD COLUMN start_date TEXT;")?;
+    }
+    Ok(())
+}
+
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[derive(Debug, Clone)]
@@ -240,6 +262,8 @@ pub struct CachedActivity {
     pub duration_s: i64,
     pub pace_sec_per_km: Option<i64>,
     pub start_date_local: String,
+    /// Strava's `start_date` — the true UTC instant the activity began.
+    pub start_date: String,
     pub url: String,
 }
 
@@ -247,8 +271,8 @@ pub fn cache_activity(conn: &Connection, activity: &CachedActivity) -> Result<()
     conn.execute(
         "INSERT OR REPLACE INTO activity_cache
          (activity_id, athlete_id, title, activity_type, distance_km, duration_s,
-          pace_sec_per_km, start_date_local, url)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+          pace_sec_per_km, start_date_local, start_date, url)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         rusqlite::params![
             activity.activity_id,
             activity.athlete_id,
@@ -258,6 +282,7 @@ pub fn cache_activity(conn: &Connection, activity: &CachedActivity) -> Result<()
             activity.duration_s,
             activity.pace_sec_per_km,
             activity.start_date_local,
+            activity.start_date,
             activity.url,
         ],
     )?;
@@ -268,8 +293,8 @@ pub fn bulk_cache_activities(conn: &Connection, activities: &[CachedActivity]) -
     let mut stmt = conn.prepare(
         "INSERT OR REPLACE INTO activity_cache
          (activity_id, athlete_id, title, activity_type, distance_km, duration_s,
-          pace_sec_per_km, start_date_local, url)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+          pace_sec_per_km, start_date_local, start_date, url)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
     )?;
     for a in activities {
         stmt.execute(rusqlite::params![
@@ -281,6 +306,7 @@ pub fn bulk_cache_activities(conn: &Connection, activities: &[CachedActivity]) -
             a.duration_s,
             a.pace_sec_per_km,
             a.start_date_local,
+            a.start_date,
             a.url,
         ])?;
     }
@@ -346,7 +372,7 @@ pub fn get_oldest_activity_date(conn: &Connection, athlete_id: i64) -> Result<Op
 pub fn get_latest_activity(conn: &Connection, athlete_id: i64) -> Result<Option<CachedActivity>> {
     let mut stmt = conn.prepare(
         "SELECT activity_id, athlete_id, title, activity_type, distance_km, duration_s,
-                pace_sec_per_km, start_date_local, url
+                pace_sec_per_km, start_date_local, start_date, url
          FROM activity_cache
          WHERE athlete_id = ?1
          ORDER BY start_date_local DESC, activity_id DESC
@@ -365,7 +391,8 @@ pub fn get_latest_activity(conn: &Connection, athlete_id: i64) -> Result<Option<
             duration_s: row.get(5)?,
             pace_sec_per_km: row.get(6)?,
             start_date_local: row.get(7)?,
-            url: row.get(8)?,
+            start_date: row.get::<_, Option<String>>(8)?.unwrap_or_default(),
+            url: row.get(9)?,
         })
     })?;
     match rows.next() {
@@ -374,12 +401,31 @@ pub fn get_latest_activity(conn: &Connection, athlete_id: i64) -> Result<Option<
     }
 }
 
-pub fn get_last_activity_date(conn: &Connection, athlete_id: i64) -> Result<Option<String>> {
+/// Most recent true-UTC `start_date` across an athlete's cached activities.
+///
+/// Used to compute the Strava `after` poll cutoff. Must be UTC, not
+/// `start_date_local` (which Strava mislabels with a `Z`): using local time
+/// pushes the cutoff hours into the future in positive-offset zones and
+/// silently drops same-day activities that start after an earlier one.
+pub fn get_last_activity_utc(conn: &Connection, athlete_id: i64) -> Result<Option<String>> {
     Ok(conn.query_row(
-        "SELECT MAX(start_date_local) FROM activity_cache WHERE athlete_id = ?1",
+        "SELECT MAX(start_date) FROM activity_cache
+         WHERE athlete_id = ?1 AND start_date IS NOT NULL AND start_date != ''",
         rusqlite::params![athlete_id],
         |row| row.get(0),
     )?)
+}
+
+/// Whether the athlete has any cached activity. Drives cold-start detection
+/// independently of `get_last_activity_utc`, which returns None for legacy rows
+/// (cached before `start_date` existed) and must not be mistaken for a fresh athlete.
+pub fn has_cached_activities(conn: &Connection, athlete_id: i64) -> Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM activity_cache WHERE athlete_id = ?1",
+        rusqlite::params![athlete_id],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
 }
 
 #[cfg(test)]
@@ -391,6 +437,40 @@ mod tests {
     fn test_db() -> Db {
         let dir = tempfile::tempdir().unwrap();
         Db::open(dir.path().join("test.db").to_str().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn test_migrate_adds_start_date_to_legacy_cache() {
+        // Simulate a database created before the start_date column existed.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE activity_cache (
+                activity_id      INTEGER PRIMARY KEY,
+                athlete_id       INTEGER NOT NULL,
+                title            TEXT,
+                activity_type    TEXT,
+                distance_km      REAL,
+                duration_s       INTEGER,
+                pace_sec_per_km  INTEGER,
+                start_date_local TEXT,
+                url              TEXT,
+                cached_at        INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+            INSERT INTO activity_cache (activity_id, athlete_id, start_date_local)
+            VALUES (1, 1, '2024-01-01T08:00:00Z');",
+        )
+        .unwrap();
+
+        assert!(!column_exists(&conn, "activity_cache", "start_date").unwrap());
+
+        init_schema(&conn).unwrap();
+        migrate_schema(&conn).unwrap();
+
+        assert!(column_exists(&conn, "activity_cache", "start_date").unwrap());
+        // Legacy row's start_date is NULL, so the UTC cutoff falls back to None.
+        assert!(get_last_activity_utc(&conn, 1).unwrap().is_none());
+        // Migration is idempotent.
+        migrate_schema(&conn).unwrap();
     }
 
     #[test]
@@ -530,6 +610,7 @@ mod tests {
                 duration_s: 3000,
                 pace_sec_per_km: Some(286),
                 start_date_local: "2024-01-15T08:30:00Z".into(),
+                start_date: "2024-01-15T08:30:00Z".into(),
                 url: "https://strava.com/activities/200".into(),
             };
             cache_activity(conn, &act).unwrap();
@@ -564,6 +645,7 @@ mod tests {
                     duration_s: 1800,
                     pace_sec_per_km: None,
                     start_date_local: date1.into(),
+                    start_date: String::new(),
                     url: String::new(),
                 },
             )
@@ -579,6 +661,7 @@ mod tests {
                     duration_s: 2700,
                     pace_sec_per_km: None,
                     start_date_local: date2.into(),
+                    start_date: String::new(),
                     url: String::new(),
                 },
             )
@@ -620,6 +703,7 @@ mod tests {
                     duration_s: 1800,
                     pace_sec_per_km: None,
                     start_date_local: "2026-05-10T23:00:00".into(), // Sunday
+                    start_date: String::new(),
                     url: String::new(),
                 },
             )
@@ -655,6 +739,7 @@ mod tests {
                     duration_s: 1800,
                     pace_sec_per_km: None,
                     start_date_local: "2026-05-11T00:01:00".into(), // Monday
+                    start_date: String::new(),
                     url: String::new(),
                 },
             )
@@ -690,6 +775,7 @@ mod tests {
                     duration_s: 3600,
                     pace_sec_per_km: None,
                     start_date_local: "2026-05-31T22:00:00".into(),
+                    start_date: String::new(),
                     url: String::new(),
                 },
             )
@@ -705,6 +791,7 @@ mod tests {
                     duration_s: 900,
                     pace_sec_per_km: None,
                     start_date_local: "2026-06-01T06:00:00".into(),
+                    start_date: String::new(),
                     url: String::new(),
                 },
             )
@@ -746,6 +833,7 @@ mod tests {
                         duration_s: 600,
                         pace_sec_per_km: None,
                         start_date_local: time_str.into(),
+                        start_date: String::new(),
                         url: String::new(),
                     },
                 )
@@ -768,6 +856,7 @@ mod tests {
                     duration_s: 300,
                     pace_sec_per_km: None,
                     start_date_local: "2026-05-10T23:59:00".into(),
+                    start_date: String::new(),
                     url: String::new(),
                 },
             )
@@ -786,7 +875,7 @@ mod tests {
         db.run(|conn| {
             insert_athlete(conn, 1, "alice", "a", "r", 0).unwrap();
 
-            assert!(get_last_activity_date(conn, 1).unwrap().is_none());
+            assert!(get_last_activity_utc(conn, 1).unwrap().is_none());
             assert!(get_oldest_activity_date(conn, 1).unwrap().is_none());
 
             cache_activity(
@@ -800,6 +889,7 @@ mod tests {
                     duration_s: 1800,
                     pace_sec_per_km: None,
                     start_date_local: "2024-01-01T00:00:00Z".into(),
+                    start_date: "2024-01-01T00:00:00Z".into(),
                     url: String::new(),
                 },
             )
@@ -815,19 +905,114 @@ mod tests {
                     duration_s: 1800,
                     pace_sec_per_km: None,
                     start_date_local: "2024-01-15T00:00:00Z".into(),
+                    start_date: "2024-01-15T00:00:00Z".into(),
                     url: String::new(),
                 },
             )
             .unwrap();
 
             assert_eq!(
-                get_last_activity_date(conn, 1).unwrap().unwrap(),
+                get_last_activity_utc(conn, 1).unwrap().unwrap(),
                 "2024-01-15T00:00:00Z"
             );
             assert_eq!(
                 get_oldest_activity_date(conn, 1).unwrap().unwrap(),
                 NaiveDate::from_ymd_opt(2024, 1, 1).unwrap()
             );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn test_last_activity_utc_uses_true_utc_not_local() {
+        // Strava labels start_date_local with a misleading `Z`. The poll `after`
+        // cutoff must come from the true-UTC start_date — using local time pushes
+        // the cutoff hours ahead in positive-offset zones, silently dropping
+        // same-day activities that start after an earlier one.
+        let db = test_db();
+        db.run(|conn| {
+            insert_athlete(conn, 1, "alice", "a", "r", 0).unwrap();
+            cache_activity(
+                conn,
+                &CachedActivity {
+                    activity_id: 1,
+                    athlete_id: 1,
+                    title: "Warmup".into(),
+                    activity_type: ActivityType::Run,
+                    distance_km: 1.0,
+                    duration_s: 500,
+                    pace_sec_per_km: None,
+                    start_date_local: "2026-06-14T07:59:51Z".into(), // AEST wall clock
+                    start_date: "2026-06-13T21:59:51Z".into(),       // true UTC, 10h earlier
+                    url: String::new(),
+                },
+            )
+            .unwrap();
+
+            assert_eq!(
+                get_last_activity_utc(conn, 1).unwrap().unwrap(),
+                "2026-06-13T21:59:51Z"
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn test_has_cached_activities() {
+        let db = test_db();
+        db.run(|conn| {
+            insert_athlete(conn, 1, "alice", "a", "r", 0).unwrap();
+            assert!(!has_cached_activities(conn, 1).unwrap());
+            cache_activity(
+                conn,
+                &CachedActivity {
+                    activity_id: 1,
+                    athlete_id: 1,
+                    title: "Run".into(),
+                    activity_type: ActivityType::Run,
+                    distance_km: 5.0,
+                    duration_s: 1800,
+                    pace_sec_per_km: None,
+                    start_date_local: "2024-01-01T08:00:00Z".into(),
+                    start_date: String::new(),
+                    url: String::new(),
+                },
+            )
+            .unwrap();
+            assert!(has_cached_activities(conn, 1).unwrap());
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn test_last_activity_utc_ignores_legacy_rows_without_start_date() {
+        // Rows cached before the start_date column existed have NULL start_date.
+        // The cutoff must ignore them (returning None so the poller falls back to
+        // its lookback window) rather than treating them as the epoch 0 / empty.
+        let db = test_db();
+        db.run(|conn| {
+            insert_athlete(conn, 1, "alice", "a", "r", 0).unwrap();
+            cache_activity(
+                conn,
+                &CachedActivity {
+                    activity_id: 1,
+                    athlete_id: 1,
+                    title: "Legacy".into(),
+                    activity_type: ActivityType::Run,
+                    distance_km: 5.0,
+                    duration_s: 1800,
+                    pace_sec_per_km: None,
+                    start_date_local: "2024-01-01T08:00:00Z".into(),
+                    start_date: String::new(),
+                    url: String::new(),
+                },
+            )
+            .unwrap();
+
+            assert!(get_last_activity_utc(conn, 1).unwrap().is_none());
             Ok(())
         })
         .unwrap();
@@ -854,6 +1039,7 @@ mod tests {
                         duration_s: 100,
                         pace_sec_per_km: None,
                         start_date_local: today.clone(),
+                        start_date: today.clone(),
                         url: String::new(),
                     },
                     CachedActivity {
@@ -865,6 +1051,7 @@ mod tests {
                         duration_s: 200,
                         pace_sec_per_km: None,
                         start_date_local: today.clone(),
+                        start_date: today.clone(),
                         url: String::new(),
                     },
                 ],
