@@ -1,6 +1,7 @@
 use anyhow::Result;
 use chrono::Utc;
 use log::{error, info, warn};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use teloxide::prelude::*;
@@ -10,7 +11,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::config::{Config, NotificationMode};
 use crate::db::{self, CachedActivity, Db};
-use crate::strava::{to_cached, StravaApi};
+use crate::strava::{to_cached, StravaActivity, StravaApi};
 use crate::types::ActivityType;
 
 pub enum PollCommand {
@@ -215,29 +216,18 @@ pub async fn process_athlete(
         return Ok(());
     }
 
-    // 4. Process each activity (newest first from Strava)
-    let mut new_activities: Vec<CachedActivity> = Vec::new();
+    // 4. Select new, tracked activities. Strava returns ascending order when
+    // `after` is set, so we check every fetched activity's seen status rather
+    // than breaking at the first seen one (which would skip newer activities
+    // that sort after it).
+    let ids: Vec<i64> = activities.iter().map(|a| a.id).collect();
+    let db_clone = Arc::clone(db);
+    let seen =
+        tokio::task::spawn_blocking(move || db_clone.run(|conn| db::get_seen_ids(conn, &ids)))
+            .await??;
 
-    for activity in &activities {
-        let db_clone = Arc::clone(db);
-        let activity_id = activity.id;
-        let seen = tokio::task::spawn_blocking(move || {
-            db_clone.run(|conn| db::is_activity_seen(conn, activity_id))
-        })
-        .await??;
-
-        if seen {
-            // Already seen => all older activities also seen (newest-first ordering)
-            break;
-        }
-
-        let cached = to_cached(activity);
-
-        // Skip non-tracked types for caching, but mark as seen
-        if tracked_types.contains(&cached.activity_type) {
-            new_activities.push(cached);
-        }
-    }
+    // Sorted oldest-first so notifications arrive chronologically.
+    let new_activities = select_new_tracked(&activities, &seen, tracked_types);
 
     if new_activities.is_empty() {
         return Ok(());
@@ -257,10 +247,7 @@ pub async fn process_athlete(
         .await??;
     }
 
-    // Cache tracked activities and send notifications
-    // Process from oldest to newest so notifications arrive chronologically
-    new_activities.reverse();
-
+    // Cache tracked activities and send notifications (already oldest-first).
     for cached in &new_activities {
         // Cache the activity
         let db_clone = Arc::clone(db);
@@ -314,6 +301,26 @@ pub async fn process_athlete(
     Ok(())
 }
 
+/// Pick the new, tracked activities to cache/notify from a fetched batch.
+///
+/// Independent of Strava's ordering: when `after` is set, Strava returns
+/// activities in ascending (oldest-first) order, so we must not stop at the
+/// first already-seen one. Returns them sorted oldest-first by UTC start so
+/// notifications arrive chronologically.
+fn select_new_tracked(
+    activities: &[StravaActivity],
+    seen: &HashSet<i64>,
+    tracked_types: &[ActivityType],
+) -> Vec<CachedActivity> {
+    let mut out: Vec<CachedActivity> = activities
+        .iter()
+        .filter(|a| !seen.contains(&a.id) && tracked_types.contains(&a.activity_type))
+        .map(to_cached)
+        .collect();
+    out.sort_by(|a, b| a.start_date.cmp(&b.start_date));
+    out
+}
+
 fn parse_iso_to_epoch(iso: &str) -> Option<i64> {
     // Try RFC 3339 first (e.g. "2024-01-15T08:30:00Z")
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(iso) {
@@ -330,6 +337,59 @@ fn parse_iso_to_epoch(iso: &str) -> Option<i64> {
 mod tests {
     #![allow(clippy::float_cmp)]
     use super::*;
+
+    fn sa(id: i64, activity_type: ActivityType, start_date: &str) -> StravaActivity {
+        StravaActivity {
+            id,
+            athlete: crate::strava::StravaAthleteSummary { id: 1 },
+            name: "Activity".into(),
+            activity_type,
+            distance: 1000.0,
+            moving_time: 300,
+            elapsed_time: 300,
+            start_date: start_date.into(),
+            start_date_local: start_date.into(),
+        }
+    }
+
+    #[test]
+    fn test_select_new_tracked_does_not_break_on_seen_in_ascending_order() {
+        // Strava returns ascending order when `after` is set, so already-seen
+        // activities appear BEFORE the new one. The new one must still be picked.
+        let seen: HashSet<i64> = [1, 2].into_iter().collect();
+        let tracked = vec![ActivityType::Run];
+        let ascending = vec![
+            sa(1, ActivityType::Run, "2026-06-18T06:00:00Z"), // seen
+            sa(2, ActivityType::Run, "2026-06-19T06:00:00Z"), // seen
+            sa(3, ActivityType::Run, "2026-06-21T06:28:00Z"), // new
+        ];
+
+        let got: Vec<i64> = select_new_tracked(&ascending, &seen, &tracked)
+            .iter()
+            .map(|c| c.activity_id)
+            .collect();
+        assert_eq!(got, vec![3]);
+    }
+
+    #[test]
+    fn test_select_new_tracked_filters_seen_and_untracked_and_sorts() {
+        let seen: HashSet<i64> = [10].into_iter().collect();
+        let tracked = vec![ActivityType::Run, ActivityType::Hike];
+        // Newest-first input, mixed types, one already seen.
+        let input = vec![
+            sa(13, ActivityType::Run, "2026-06-22T06:00:00Z"),
+            sa(12, ActivityType::Ride, "2026-06-21T06:00:00Z"), // untracked
+            sa(11, ActivityType::Hike, "2026-06-20T06:00:00Z"),
+            sa(10, ActivityType::Run, "2026-06-19T06:00:00Z"), // seen
+        ];
+
+        let got: Vec<i64> = select_new_tracked(&input, &seen, &tracked)
+            .iter()
+            .map(|c| c.activity_id)
+            .collect();
+        // 12 dropped (untracked), 10 dropped (seen); remainder sorted oldest-first.
+        assert_eq!(got, vec![11, 13]);
+    }
 
     #[test]
     fn test_parse_iso_to_epoch_valid() {

@@ -1,6 +1,7 @@
 use anyhow::Result;
 use chrono::{Datelike, Local, NaiveDate};
 use rusqlite::Connection;
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -230,6 +231,18 @@ pub fn is_activity_seen(conn: &Connection, activity_id: i64) -> Result<bool> {
     let mut stmt = conn.prepare("SELECT COUNT(*) FROM seen_activities WHERE activity_id = ?1")?;
     let count: i64 = stmt.query_row(rusqlite::params![activity_id], |row| row.get(0))?;
     Ok(count > 0)
+}
+
+/// Subset of `ids` that are already in `seen_activities`.
+pub fn get_seen_ids(conn: &Connection, ids: &[i64]) -> Result<HashSet<i64>> {
+    let mut stmt = conn.prepare("SELECT 1 FROM seen_activities WHERE activity_id = ?1")?;
+    let mut seen = HashSet::new();
+    for &id in ids {
+        if stmt.exists([id])? {
+            seen.insert(id);
+        }
+    }
+    Ok(seen)
 }
 
 pub fn mark_activity_seen(conn: &Connection, activity_id: i64, athlete_id: i64) -> Result<()> {
@@ -589,6 +602,24 @@ mod tests {
             assert!(is_activity_seen(conn, 101).unwrap());
             assert!(is_activity_seen(conn, 102).unwrap());
             assert!(is_activity_seen(conn, 103).unwrap());
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn test_get_seen_ids() {
+        let db = test_db();
+
+        db.run(|conn| {
+            insert_athlete(conn, 1, "alice", "a", "r", 0).unwrap();
+            bulk_mark_seen(conn, &[(10, 1), (11, 1)]).unwrap();
+
+            let set = get_seen_ids(conn, &[10, 11, 12]).unwrap();
+            assert_eq!(set.len(), 2);
+            assert!(set.contains(&10));
+            assert!(set.contains(&11));
+            assert!(!set.contains(&12));
             Ok(())
         })
         .unwrap();
