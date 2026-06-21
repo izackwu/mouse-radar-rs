@@ -168,6 +168,7 @@ pub fn to_cached(activity: &StravaActivity) -> CachedActivity {
         duration_s: activity.elapsed_time,
         pace_sec_per_km: pace,
         start_date_local: activity.start_date_local.clone(),
+        start_date: activity.start_date.clone(),
         url: format!("https://www.strava.com/activities/{}", activity.id),
     }
 }
@@ -195,6 +196,7 @@ mod tests {
 
         let cached = to_cached(&act);
         assert_eq!(cached.activity_id, 123);
+        assert_eq!(cached.start_date, "2024-01-01T00:00:00Z");
         assert_eq!(cached.distance_km, 10.0);
         assert_eq!(cached.duration_s, 3100);
         // pace: 3000 sec / 10 km = 300 sec/km
