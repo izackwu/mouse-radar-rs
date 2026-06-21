@@ -180,20 +180,31 @@ pub async fn process_athlete(
         }
     }
 
-    // 2. Determine the `after` epoch for the API call
+    // 2. Determine the `after` epoch for the API call.
+    // Must use the true-UTC start_date: start_date_local is mislabeled `Z` by
+    // Strava, so deriving the cutoff from it would jump hours into the future in
+    // positive-offset zones and drop same-day activities after the first.
     let db_clone = Arc::clone(db);
     let strava_id = athlete.strava_id;
-    let last_date: Option<String> = tokio::task::spawn_blocking(move || {
-        db_clone.run(|conn| db::get_last_activity_date(conn, strava_id))
+    let (last_utc, has_cached): (Option<String>, bool) = tokio::task::spawn_blocking(move || {
+        db_clone.run(|conn| {
+            Ok((
+                db::get_last_activity_utc(conn, strava_id)?,
+                db::has_cached_activities(conn, strava_id)?,
+            ))
+        })
     })
     .await??;
 
-    let after_epoch = last_date
+    // Cold start is "never cached anything for this athlete", not "no UTC cutoff":
+    // existing athletes have legacy rows with no start_date, so last_utc is None
+    // for them on the first poll after deploy — they must still be notified.
+    let after_epoch = last_utc
         .as_ref()
         .and_then(|d| parse_iso_to_epoch(d))
         .unwrap_or_else(|| (Utc::now() - lookback).timestamp());
 
-    let is_cold_start = last_date.is_none();
+    let is_cold_start = !has_cached;
 
     // 3. Fetch activities
     let activities = strava

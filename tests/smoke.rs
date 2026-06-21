@@ -140,6 +140,7 @@ fn test_cache_survives_reopen() {
                     duration_s: 2400,
                     pace_sec_per_km: Some(300),
                     start_date_local: "2026-05-14T08:00:00Z".into(),
+                    start_date: "2026-05-14T08:00:00Z".into(),
                     url: "https://strava.com/activities/1".into(),
                 },
             )
