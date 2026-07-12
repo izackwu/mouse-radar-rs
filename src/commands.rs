@@ -16,32 +16,28 @@ fn to_request_error(e: impl std::fmt::Display) -> RequestError {
     RequestError::Io(std::sync::Arc::new(std::io::Error::other(e.to_string())))
 }
 
+// Doc comments here double as the bot's /help text, so no rustdoc backticks.
+#[allow(clippy::doc_markdown)]
 #[derive(BotCommands, Clone)]
 #[command(rename_rule = "lowercase")]
 pub enum Command {
-    #[command(description = "Show this help message")]
+    /// Show this help message
     Help,
-    #[command(description = "List all tracked athletes")]
+    /// List all tracked athletes
     List,
-    #[command(description = "Show stats for an athlete. Usage: /strava <name>")]
+    /// Show stats for an athlete. Usage: /strava <name>
     Strava(String),
-    #[command(
-        description = "Register a new athlete (admin only). Usage: /register <name> <strava_id>",
-        parse_with = "split"
-    )]
+    /// Register a new athlete (admin only). Usage: /register <name> <strava_id>
+    #[command(parse_with = "split")]
     Register { name: String, strava_id: i64 },
-    #[command(
-        description = "Authorize an athlete with OAuth code (admin only). Usage: /auth <name> <strava_id> <code>",
-        parse_with = "split"
-    )]
+    /// Authorize an athlete with OAuth code (admin only). Usage: /auth <name> <strava_id> <code>
+    #[command(parse_with = "split")]
     Auth {
         name: String,
         strava_id: i64,
         code: String,
     },
-    #[command(
-        description = "Show the latest activity for an athlete with card image. Usage: /latest <name>"
-    )]
+    /// Show the latest activity for an athlete with card image. Usage: /latest <name>
     Latest(String),
 }
 
