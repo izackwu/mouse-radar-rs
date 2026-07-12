@@ -44,16 +44,23 @@ async fn main() -> anyhow::Result<()> {
         poll_tx,
     });
 
-    // Command handler — commands go to handle_command, everything else is silently ignored
+    // Command handler — commands go to handle_command; our commands with bad
+    // arguments (which fail filter_command's typed parsing) get a usage reply;
+    // everything else is silently ignored
     let handler = dptree::entry()
         .branch(
             Update::filter_message()
                 .filter_command::<Command>()
                 .endpoint(commands::handle_command),
         )
-        .branch(
-            Update::filter_message().endpoint(|_bot: Bot, _msg: Message| async move { Ok(()) }),
-        );
+        .branch(Update::filter_message().endpoint(
+            |bot: Bot, msg: Message, me: teloxide::types::Me| async move {
+                if let Some(usage) = commands::usage_for(msg.text().unwrap_or(""), me.username()) {
+                    bot.send_message(msg.chat.id, usage).await?;
+                }
+                Ok(())
+            },
+        ));
 
     let mut dispatcher = Dispatcher::builder(bot.clone(), handler)
         .dependencies(dptree::deps![app_state])
