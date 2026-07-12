@@ -16,21 +16,49 @@ fn to_request_error(e: impl std::fmt::Display) -> RequestError {
     RequestError::Io(std::sync::Arc::new(std::io::Error::other(e.to_string())))
 }
 
+// Doc comments here double as the bot's /help text, so no rustdoc backticks.
+#[allow(clippy::doc_markdown)]
 #[derive(BotCommands, Clone)]
 #[command(rename_rule = "lowercase")]
 pub enum Command {
-    #[command(description = "Show this help message")]
+    /// Show this help message
     Help,
-    #[command(description = "List all tracked athletes")]
+    /// List all tracked athletes
     List,
-    #[command(description = "Show stats for an athlete")]
+    /// Show stats for an athlete. Usage: /strava <name>
     Strava(String),
-    #[command(description = "Register a new athlete (admin only)")]
-    Register(String),
-    #[command(description = "Authorize an athlete with OAuth code (admin only)")]
-    Auth(String),
-    #[command(description = "Show the latest activity for an athlete with card image")]
+    /// Register a new athlete (admin only). Usage: /register <name> <strava_id>
+    #[command(parse_with = "split")]
+    Register { name: String, strava_id: i64 },
+    /// Authorize an athlete with OAuth code (admin only). Usage: /auth <name> <strava_id> <code>
+    #[command(parse_with = "split")]
+    Auth {
+        name: String,
+        strava_id: i64,
+        code: String,
+    },
+    /// Show the latest activity for an athlete with card image. Usage: /latest <name>
     Latest(String),
+}
+
+/// Usage line for a message that looks like one of our commands but failed to
+/// parse (wrong/missing arguments). Returns `None` for anything else so
+/// unrelated chat messages and other bots' commands stay ignored.
+#[must_use]
+pub fn usage_for(text: &str, bot_username: &str) -> Option<String> {
+    let first = text.split_whitespace().next()?;
+    let cmd = first.strip_prefix('/')?;
+    let (name, mention) = match cmd.split_once('@') {
+        Some((n, m)) => (n, Some(m)),
+        None => (cmd, None),
+    };
+    if mention.is_some_and(|m| !m.eq_ignore_ascii_case(bot_username)) {
+        return None;
+    }
+    Command::bot_commands()
+        .into_iter()
+        .find(|c| c.command.trim_start_matches('/') == name)
+        .map(|c| c.description)
 }
 
 #[derive(Clone)]
@@ -68,19 +96,14 @@ pub async fn handle_command(
         Command::Help => cmd_help(bot, msg).await,
         Command::List => cmd_list(bot, msg, state).await,
         Command::Strava(name) => cmd_strava(bot, msg, name, state).await,
-        Command::Register(args) => {
-            let parts: Vec<&str> = args.split_whitespace().collect();
-            let name = parts.first().copied().unwrap_or("").to_string();
-            let strava_id = parts.get(1).copied().unwrap_or("").to_string();
+        Command::Register { name, strava_id } => {
             cmd_register(bot, msg, name, strava_id, state).await
         }
-        Command::Auth(args) => {
-            let parts: Vec<&str> = args.split_whitespace().collect();
-            let name = parts.first().copied().unwrap_or("").to_string();
-            let strava_id = parts.get(1).copied().unwrap_or("").to_string();
-            let code = parts.get(2).copied().unwrap_or("").to_string();
-            cmd_auth(bot, msg, name, strava_id, code, state).await
-        }
+        Command::Auth {
+            name,
+            strava_id,
+            code,
+        } => cmd_auth(bot, msg, name, strava_id, code, state).await,
         Command::Latest(name) => cmd_latest(bot, msg, name, state).await,
     }
 }
@@ -186,7 +209,7 @@ async fn cmd_register(
     bot: Bot,
     msg: Message,
     name: String,
-    strava_id: String,
+    strava_id: i64,
     state: Arc<AppState>,
 ) -> ResponseResult<()> {
     if !is_admin(&msg, &state.config) {
@@ -217,7 +240,7 @@ async fn cmd_auth(
     bot: Bot,
     msg: Message,
     name: String,
-    strava_id: String,
+    strava_id: i64,
     code: String,
     state: Arc<AppState>,
 ) -> ResponseResult<()> {
@@ -226,14 +249,6 @@ async fn cmd_auth(
             .await?;
         return Ok(());
     }
-
-    let strava_id_int: i64 = if let Ok(id) = strava_id.parse() {
-        id
-    } else {
-        bot.send_message(msg.chat.id, "Invalid Strava ID — must be a number.")
-            .await?;
-        return Ok(());
-    };
 
     // Exchange code for tokens
     let http = reqwest::Client::new();
@@ -278,7 +293,7 @@ async fn cmd_auth(
     let exp = token.expires_at;
 
     tokio::task::spawn_blocking(move || {
-        db.run(|conn| db::upsert_athlete(conn, strava_id_int, &n, &acc, &refr, exp))
+        db.run(|conn| db::upsert_athlete(conn, strava_id, &n, &acc, &refr, exp))
     })
     .await
     .map_err(|e| {
@@ -296,12 +311,12 @@ async fn cmd_auth(
     )
     .await?;
 
-    info!("Athlete {} ({}) authorized", name, strava_id_int);
+    info!("Athlete {} ({}) authorized", name, strava_id);
 
     // Notify the poller to cold-start this athlete immediately
     let _ = state
         .poll_tx
-        .send(crate::poller::PollCommand::ColdStart(strava_id_int));
+        .send(crate::poller::PollCommand::ColdStart(strava_id));
 
     Ok(())
 }
@@ -372,6 +387,68 @@ async fn cmd_latest(
 mod tests {
     #![allow(clippy::float_cmp)]
     use super::*;
+
+    #[test]
+    fn test_parse_register_typed() {
+        let cmd = Command::parse("/register zack 96951505", "testbot").unwrap();
+        match cmd {
+            Command::Register { name, strava_id } => {
+                assert_eq!(name, "zack");
+                assert_eq!(strava_id, 96_951_505);
+            }
+            _ => panic!("expected Register"),
+        }
+    }
+
+    #[test]
+    fn test_parse_auth_typed() {
+        let cmd = Command::parse("/auth zack 96951505 abc123", "testbot").unwrap();
+        match cmd {
+            Command::Auth {
+                name,
+                strava_id,
+                code,
+            } => {
+                assert_eq!(name, "zack");
+                assert_eq!(strava_id, 96_951_505);
+                assert_eq!(code, "abc123");
+            }
+            _ => panic!("expected Auth"),
+        }
+    }
+
+    #[test]
+    fn test_parse_rejects_missing_or_invalid_args() {
+        assert!(Command::parse("/register", "testbot").is_err());
+        assert!(Command::parse("/register zack", "testbot").is_err());
+        assert!(Command::parse("/register zack notanumber", "testbot").is_err());
+        assert!(Command::parse("/auth zack 96951505", "testbot").is_err());
+    }
+
+    #[test]
+    fn test_help_includes_usage() {
+        let help = Command::descriptions().to_string();
+        assert!(help.contains("/register <name> <strava_id>"));
+        assert!(help.contains("/auth <name> <strava_id> <code>"));
+        assert!(help.contains("/strava <name>"));
+        assert!(help.contains("/latest <name>"));
+    }
+
+    #[test]
+    fn test_usage_for_malformed_command() {
+        let usage = usage_for("/register zack", "testbot").unwrap();
+        assert!(usage.contains("/register <name> <strava_id>"));
+
+        let usage = usage_for("/auth@testbot zack", "testbot").unwrap();
+        assert!(usage.contains("/auth <name> <strava_id> <code>"));
+    }
+
+    #[test]
+    fn test_usage_for_ignores_other_text_and_bots() {
+        assert!(usage_for("hello world", "testbot").is_none());
+        assert!(usage_for("/unknowncmd foo", "testbot").is_none());
+        assert!(usage_for("/register@otherbot zack", "testbot").is_none());
+    }
 
     #[test]
     fn test_admin_check_logic() {
