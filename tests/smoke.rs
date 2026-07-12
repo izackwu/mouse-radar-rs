@@ -43,7 +43,7 @@ async fn test_full_pipeline_with_mock() {
     let db = Arc::new(Db::open(db_path.to_str().unwrap()).unwrap());
 
     // Insert a test athlete
-    db.run(|conn| db::insert_athlete(conn, 12345, "testuser", "acc", "ref", 9_999_999_999))
+    db.run(|conn| db::upsert_athlete(conn, 12345, "testuser", "acc", "ref", 9_999_999_999))
         .unwrap();
 
     // Create mock Strava with one activity
@@ -128,7 +128,7 @@ fn test_cache_survives_reopen() {
     {
         let db = Db::open(db_path.to_str().unwrap()).unwrap();
         db.run(|conn| {
-            db::insert_athlete(conn, 1, "alice", "a", "r", 0).unwrap();
+            db::upsert_athlete(conn, 1, "alice", "a", "r", 0).unwrap();
             db::cache_activity(
                 conn,
                 &CachedActivity {
