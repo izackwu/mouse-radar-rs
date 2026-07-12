@@ -278,7 +278,7 @@ async fn cmd_auth(
     let exp = token.expires_at;
 
     tokio::task::spawn_blocking(move || {
-        db.run(|conn| db::insert_athlete(conn, strava_id_int, &n, &acc, &refr, exp))
+        db.run(|conn| db::upsert_athlete(conn, strava_id_int, &n, &acc, &refr, exp))
     })
     .await
     .map_err(|e| {

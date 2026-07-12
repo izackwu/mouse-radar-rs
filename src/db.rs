@@ -154,7 +154,7 @@ pub struct Athlete {
     pub added_at: i64,
 }
 
-pub fn insert_athlete(
+pub fn upsert_athlete(
     conn: &Connection,
     strava_id: i64,
     name: &str,
@@ -164,7 +164,12 @@ pub fn insert_athlete(
 ) -> Result<()> {
     conn.execute(
         "INSERT INTO athletes (strava_id, name, access_token, refresh_token, token_expires)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(strava_id) DO UPDATE SET
+             name = excluded.name,
+             access_token = excluded.access_token,
+             refresh_token = excluded.refresh_token,
+             token_expires = excluded.token_expires",
         rusqlite::params![strava_id, name, access_token, refresh_token, token_expires],
     )?;
     Ok(())
@@ -517,7 +522,7 @@ mod tests {
         let db = test_db();
 
         db.run(|conn| {
-            insert_athlete(conn, 12345, "alice", "acc_tok", "ref_tok", 1_710_000_000).unwrap();
+            upsert_athlete(conn, 12345, "alice", "acc_tok", "ref_tok", 1_710_000_000).unwrap();
 
             let a = get_athlete(conn, 12345).unwrap().unwrap();
             assert_eq!(a.strava_id, 12345);
@@ -535,8 +540,8 @@ mod tests {
         let db = test_db();
 
         db.run(|conn| {
-            insert_athlete(conn, 1, "alice", "a", "r", 0).unwrap();
-            insert_athlete(conn, 2, "bob", "a", "r", 0).unwrap();
+            upsert_athlete(conn, 1, "alice", "a", "r", 0).unwrap();
+            upsert_athlete(conn, 2, "bob", "a", "r", 0).unwrap();
 
             let list = list_athletes(conn).unwrap();
             assert_eq!(list.len(), 2);
@@ -548,11 +553,33 @@ mod tests {
     }
 
     #[test]
+    fn test_reauth_existing_athlete_updates_tokens() {
+        let db = test_db();
+
+        db.run(|conn| {
+            upsert_athlete(conn, 1, "alice", "old_acc", "old_ref", 100).unwrap();
+            // Re-authorizing (e.g. after switching Strava apps) must not fail
+            upsert_athlete(conn, 1, "alice2", "new_acc", "new_ref", 200).unwrap();
+
+            let a = get_athlete(conn, 1).unwrap().unwrap();
+            assert_eq!(a.name, "alice2");
+            assert_eq!(a.access_token, "new_acc");
+            assert_eq!(a.refresh_token, "new_ref");
+            assert_eq!(a.token_expires, 200);
+
+            let list = list_athletes(conn).unwrap();
+            assert_eq!(list.len(), 1);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
     fn test_update_athlete_tokens() {
         let db = test_db();
 
         db.run(|conn| {
-            insert_athlete(conn, 1, "alice", "old_acc", "old_ref", 100).unwrap();
+            upsert_athlete(conn, 1, "alice", "old_acc", "old_ref", 100).unwrap();
             update_athlete_tokens(conn, 1, "new_acc", "new_ref", 200).unwrap();
 
             let a = get_athlete(conn, 1).unwrap().unwrap();
@@ -581,7 +608,7 @@ mod tests {
         let db = test_db();
 
         db.run(|conn| {
-            insert_athlete(conn, 1, "alice", "a", "r", 0).unwrap();
+            upsert_athlete(conn, 1, "alice", "a", "r", 0).unwrap();
 
             assert!(!is_activity_seen(conn, 100).unwrap());
             mark_activity_seen(conn, 100, 1).unwrap();
@@ -596,7 +623,7 @@ mod tests {
         let db = test_db();
 
         db.run(|conn| {
-            insert_athlete(conn, 1, "alice", "a", "r", 0).unwrap();
+            upsert_athlete(conn, 1, "alice", "a", "r", 0).unwrap();
 
             bulk_mark_seen(conn, &[(101, 1), (102, 1), (103, 1)]).unwrap();
             assert!(is_activity_seen(conn, 101).unwrap());
@@ -612,7 +639,7 @@ mod tests {
         let db = test_db();
 
         db.run(|conn| {
-            insert_athlete(conn, 1, "alice", "a", "r", 0).unwrap();
+            upsert_athlete(conn, 1, "alice", "a", "r", 0).unwrap();
             bulk_mark_seen(conn, &[(10, 1), (11, 1)]).unwrap();
 
             let set = get_seen_ids(conn, &[10, 11, 12]).unwrap();
@@ -630,7 +657,7 @@ mod tests {
         let db = test_db();
 
         db.run(|conn| {
-            insert_athlete(conn, 1, "alice", "a", "r", 0).unwrap();
+            upsert_athlete(conn, 1, "alice", "a", "r", 0).unwrap();
 
             let act = CachedActivity {
                 activity_id: 200,
@@ -659,7 +686,7 @@ mod tests {
         let db = test_db();
 
         db.run(|conn| {
-            insert_athlete(conn, 1, "alice", "a", "r", 0).unwrap();
+            upsert_athlete(conn, 1, "alice", "a", "r", 0).unwrap();
 
             // Use fixed dates within the same week/month
             let date1 = "2026-05-14T08:00:00"; // Thursday
@@ -721,7 +748,7 @@ mod tests {
         // Activity at 23:00 Sunday local time — counts for the week ending that Sunday
         let db = test_db();
         db.run(|conn| {
-            insert_athlete(conn, 1, "alice", "a", "r", 0).unwrap();
+            upsert_athlete(conn, 1, "alice", "a", "r", 0).unwrap();
 
             cache_activity(
                 conn,
@@ -757,7 +784,7 @@ mod tests {
         // Activity at 00:01 Monday local time — counts for the new week
         let db = test_db();
         db.run(|conn| {
-            insert_athlete(conn, 1, "alice", "a", "r", 0).unwrap();
+            upsert_athlete(conn, 1, "alice", "a", "r", 0).unwrap();
 
             cache_activity(
                 conn,
@@ -793,7 +820,7 @@ mod tests {
         // Month-end: May 31 vs Jun 1
         let db = test_db();
         db.run(|conn| {
-            insert_athlete(conn, 1, "alice", "a", "r", 0).unwrap();
+            upsert_athlete(conn, 1, "alice", "a", "r", 0).unwrap();
 
             cache_activity(
                 conn,
@@ -845,7 +872,7 @@ mod tests {
         // `date(start_date_local)` extracts only the date part, ignoring time
         let db = test_db();
         db.run(|conn| {
-            insert_athlete(conn, 1, "alice", "a", "r", 0).unwrap();
+            upsert_athlete(conn, 1, "alice", "a", "r", 0).unwrap();
 
             // Same date, different times — should all be included
             for (time_str, activity_id_val) in [
@@ -904,7 +931,7 @@ mod tests {
         let db = test_db();
 
         db.run(|conn| {
-            insert_athlete(conn, 1, "alice", "a", "r", 0).unwrap();
+            upsert_athlete(conn, 1, "alice", "a", "r", 0).unwrap();
 
             assert!(get_last_activity_utc(conn, 1).unwrap().is_none());
             assert!(get_oldest_activity_date(conn, 1).unwrap().is_none());
@@ -963,7 +990,7 @@ mod tests {
         // same-day activities that start after an earlier one.
         let db = test_db();
         db.run(|conn| {
-            insert_athlete(conn, 1, "alice", "a", "r", 0).unwrap();
+            upsert_athlete(conn, 1, "alice", "a", "r", 0).unwrap();
             cache_activity(
                 conn,
                 &CachedActivity {
@@ -994,7 +1021,7 @@ mod tests {
     fn test_has_cached_activities() {
         let db = test_db();
         db.run(|conn| {
-            insert_athlete(conn, 1, "alice", "a", "r", 0).unwrap();
+            upsert_athlete(conn, 1, "alice", "a", "r", 0).unwrap();
             assert!(!has_cached_activities(conn, 1).unwrap());
             cache_activity(
                 conn,
@@ -1025,7 +1052,7 @@ mod tests {
         // its lookback window) rather than treating them as the epoch 0 / empty.
         let db = test_db();
         db.run(|conn| {
-            insert_athlete(conn, 1, "alice", "a", "r", 0).unwrap();
+            upsert_athlete(conn, 1, "alice", "a", "r", 0).unwrap();
             cache_activity(
                 conn,
                 &CachedActivity {
@@ -1054,7 +1081,7 @@ mod tests {
         let db = test_db();
 
         db.run(|conn| {
-            insert_athlete(conn, 1, "alice", "a", "r", 0).unwrap();
+            upsert_athlete(conn, 1, "alice", "a", "r", 0).unwrap();
 
             let today = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
