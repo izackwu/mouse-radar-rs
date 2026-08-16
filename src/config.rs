@@ -13,6 +13,62 @@ pub enum NotificationMode {
     CardAndText,
 }
 
+/// Settings for the AI activity-comment feature.
+///
+/// `Debug` is hand-written rather than derived: `Config` derives `Debug` and
+/// is logged at startup, so a derived impl would print the API key.
+#[derive(Clone)]
+pub struct AiConfig {
+    pub api_key: String,
+    pub base_url: String,
+    pub model: String,
+    pub history_limit: usize,
+    pub timeout_seconds: u64,
+    pub max_chars: usize,
+    pub system_prompt: Option<String>,
+}
+
+impl std::fmt::Debug for AiConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AiConfig")
+            .field("api_key", &"<redacted>")
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .field("history_limit", &self.history_limit)
+            .field("timeout_seconds", &self.timeout_seconds)
+            .field("max_chars", &self.max_chars)
+            .field(
+                "system_prompt",
+                &self.system_prompt.as_ref().map(|_| "<custom>"),
+            )
+            .finish()
+    }
+}
+
+impl AiConfig {
+    /// Returns `None` when `AI_API_KEY` is unset or blank, which disables the
+    /// whole feature. Everything else has a default.
+    fn from_env() -> Option<Self> {
+        let api_key = env::var("AI_API_KEY")
+            .ok()
+            .map(|k| k.trim().to_string())
+            .filter(|k| !k.is_empty())?;
+
+        Some(Self {
+            api_key,
+            base_url: env::var("AI_BASE_URL")
+                .unwrap_or_else(|_| "https://api.openai.com/v1".into()),
+            model: env::var("AI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into()),
+            history_limit: parse_env_default("AI_HISTORY_LIMIT", 30),
+            timeout_seconds: parse_env_default("AI_TIMEOUT_SECONDS", 20),
+            max_chars: parse_env_default("AI_MAX_CHARS", 280),
+            system_prompt: env::var("AI_SYSTEM_PROMPT")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
+        })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub telegram_bot_token: String,
@@ -25,6 +81,7 @@ pub struct Config {
     pub bot_admin_usernames: Vec<String>,
     pub tracked_activity_types: Vec<ActivityType>,
     pub notification_mode: NotificationMode,
+    pub ai: Option<AiConfig>,
 }
 
 impl Config {
@@ -65,7 +122,26 @@ impl Config {
                 .filter(|t| *t != ActivityType::Other)
                 .collect(),
             notification_mode,
+            ai: AiConfig::from_env(),
         })
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            telegram_bot_token: String::new(),
+            telegram_chat_id: String::new(),
+            strava_client_id: String::new(),
+            strava_client_secret: String::new(),
+            poll_interval_seconds: 300,
+            cold_start_lookback_days: 30,
+            database_path: "./data/bot.db".into(),
+            bot_admin_usernames: Vec::new(),
+            tracked_activity_types: Vec::new(),
+            notification_mode: NotificationMode::CardAndText,
+            ai: None,
+        }
     }
 }
 
@@ -123,6 +199,7 @@ mod tests {
         env::remove_var("COLD_START_LOOKBACK_DAYS");
         env::remove_var("TRACKED_ACTIVITY_TYPES");
         env::remove_var("NOTIFICATION_MODE");
+        env::remove_var("AI_API_KEY");
         env::set_var("TELEGRAM_BOT_TOKEN", "t");
         env::set_var("TELEGRAM_CHAT_ID", "c");
         env::set_var("STRAVA_CLIENT_ID", "id");
@@ -198,5 +275,78 @@ mod tests {
         assert!(msg.contains("card_and_text"));
 
         env::remove_var("NOTIFICATION_MODE");
+    }
+
+    #[test]
+    fn test_ai_disabled_when_no_api_key() {
+        let _guard = CONFIG_LOCK.lock().unwrap();
+        env::remove_var("AI_API_KEY");
+        env::set_var("TELEGRAM_BOT_TOKEN", "t");
+        env::set_var("TELEGRAM_CHAT_ID", "c");
+        env::set_var("STRAVA_CLIENT_ID", "id");
+        env::set_var("STRAVA_CLIENT_SECRET", "secret");
+
+        let cfg = Config::from_env().unwrap();
+        assert!(cfg.ai.is_none());
+    }
+
+    #[test]
+    fn test_ai_blank_api_key_is_disabled() {
+        let _guard = CONFIG_LOCK.lock().unwrap();
+        env::set_var("TELEGRAM_BOT_TOKEN", "t");
+        env::set_var("TELEGRAM_CHAT_ID", "c");
+        env::set_var("STRAVA_CLIENT_ID", "id");
+        env::set_var("STRAVA_CLIENT_SECRET", "secret");
+        env::set_var("AI_API_KEY", "   ");
+
+        let cfg = Config::from_env().unwrap();
+        assert!(cfg.ai.is_none());
+
+        env::remove_var("AI_API_KEY");
+    }
+
+    #[test]
+    fn test_ai_enabled_with_defaults() {
+        let _guard = CONFIG_LOCK.lock().unwrap();
+        env::set_var("TELEGRAM_BOT_TOKEN", "t");
+        env::set_var("TELEGRAM_CHAT_ID", "c");
+        env::set_var("STRAVA_CLIENT_ID", "id");
+        env::set_var("STRAVA_CLIENT_SECRET", "secret");
+        env::set_var("AI_API_KEY", "sk-test");
+        env::remove_var("AI_BASE_URL");
+        env::remove_var("AI_MODEL");
+        env::remove_var("AI_HISTORY_LIMIT");
+        env::remove_var("AI_TIMEOUT_SECONDS");
+        env::remove_var("AI_MAX_CHARS");
+        env::remove_var("AI_SYSTEM_PROMPT");
+
+        let ai = Config::from_env().unwrap().ai.unwrap();
+        assert_eq!(ai.api_key, "sk-test");
+        assert_eq!(ai.base_url, "https://api.openai.com/v1");
+        assert_eq!(ai.model, "gpt-4o-mini");
+        assert_eq!(ai.history_limit, 30);
+        assert_eq!(ai.timeout_seconds, 20);
+        assert_eq!(ai.max_chars, 280);
+        assert!(ai.system_prompt.is_none());
+
+        env::remove_var("AI_API_KEY");
+    }
+
+    #[test]
+    fn test_ai_debug_redacts_api_key() {
+        let ai = AiConfig {
+            api_key: "sk-supersecret".into(),
+            base_url: "https://api.openai.com/v1".into(),
+            model: "gpt-4o-mini".into(),
+            history_limit: 30,
+            timeout_seconds: 20,
+            max_chars: 280,
+            system_prompt: Some("custom persona".into()),
+        };
+        let rendered = format!("{:?}", ai);
+        assert!(!rendered.contains("sk-supersecret"));
+        assert!(!rendered.contains("custom persona"));
+        assert!(rendered.contains("<redacted>"));
+        assert!(rendered.contains("gpt-4o-mini"));
     }
 }

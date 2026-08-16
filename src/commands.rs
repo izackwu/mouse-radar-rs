@@ -463,6 +463,7 @@ mod tests {
             database_path: String::new(),
             tracked_activity_types: vec![],
             notification_mode: crate::config::NotificationMode::CardAndText,
+            ai: None,
         };
 
         assert!(config.bot_admin_usernames.iter().any(|a| a == "alice"));
