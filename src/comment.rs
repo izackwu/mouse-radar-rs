@@ -2,6 +2,8 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use log::{debug, warn};
+use teloxide::prelude::*;
+use teloxide::types::{MessageId, ReplyParameters};
 
 use crate::ai::AiClient;
 use crate::config::AiConfig;
@@ -290,6 +292,58 @@ pub async fn compose_comment(
 
     let raw = ai.comment(system, &user).await?;
     Ok(sanitize(&raw, cfg.max_chars))
+}
+
+/// Fire-and-forget: generate the comment and post it as a threaded reply.
+///
+/// Spawned after the notification has already been sent, so nothing here can
+/// delay or break a notification. All failures are logged and dropped.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_comment(
+    ai: Arc<dyn AiClient>,
+    strava: Arc<dyn StravaApi>,
+    db: Arc<Db>,
+    bot: Bot,
+    chat_id: ChatId,
+    reply_to: MessageId,
+    cfg: AiConfig,
+    access_token: String,
+    athlete_name: String,
+    activity: CachedActivity,
+) {
+    tokio::spawn(async move {
+        let text = match compose_comment(
+            &ai,
+            &strava,
+            &db,
+            &cfg,
+            &access_token,
+            &athlete_name,
+            &activity,
+        )
+        .await
+        {
+            Ok(Some(text)) => text,
+            Ok(None) => return,
+            Err(e) => {
+                warn!("AI comment failed for {}: {}", athlete_name, e);
+                return;
+            }
+        };
+
+        // Plain text, no parse_mode: the model emits '.', '-', '(' freely and
+        // MarkdownV2 would reject nearly every message — silently, since we
+        // swallow the error.
+        if let Err(e) = bot
+            .send_message(chat_id, text)
+            .reply_parameters(ReplyParameters::new(reply_to))
+            .await
+        {
+            warn!("Failed to send AI comment for {}: {}", athlete_name, e);
+        } else {
+            debug!("AI comment posted for {}", athlete_name);
+        }
+    });
 }
 
 #[cfg(test)]

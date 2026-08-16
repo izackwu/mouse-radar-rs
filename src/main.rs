@@ -33,6 +33,20 @@ async fn main() -> anyhow::Result<()> {
         config.strava_client_secret.clone(),
     ));
 
+    // AI client — None disables activity comments entirely
+    let ai_client: Option<Arc<dyn ai::AiClient>> = if let Some(c) = &config.ai {
+        info!("AI comments enabled (model {})", c.model);
+        Some(Arc::new(ai::OpenAiCompatClient::new(
+            c.base_url.clone(),
+            c.model.clone(),
+            c.api_key.clone(),
+            std::time::Duration::from_secs(c.timeout_seconds),
+        )?))
+    } else {
+        info!("AI comments disabled (AI_API_KEY not set)");
+        None
+    };
+
     // Build Telegram bot
     let bot = Bot::new(config.telegram_bot_token.clone());
 
@@ -76,6 +90,7 @@ async fn main() -> anyhow::Result<()> {
         strava_client,
         bot.clone(),
         poll_rx,
+        ai_client,
     ));
 
     // Verify connectivity and clear webhook

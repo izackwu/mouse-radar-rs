@@ -12,7 +12,12 @@ Project notes for Claude Code (and other AI coding assistants).
 src/
 ├── main.rs        # tokio runtime, wires teloxide bot + poller, dispatches commands
 ├── lib.rs         # re-exports the modules below so integration tests can import them
+├── ai.rs          # AiClient trait + OpenAI-compatible client (any provider
+│                  # speaking that wire format; selected by AI_BASE_URL/AI_MODEL)
 ├── config.rs      # env-driven Config; parsed once at startup
+├── comment.rs     # AI activity comment: builds the grounded prompt from
+│                  # activity detail + history, sanitizes, posts as a threaded
+│                  # reply. Fully detached — never blocks a notification
 ├── db.rs          # rusqlite wrapper: athletes, seen_activities, activity_cache tables
 │                  # (activity_cache powers the week/month stats on the card)
 ├── strava.rs      # StravaApi trait + StravaClient (reqwest). Trait exists for mocking
@@ -73,3 +78,10 @@ CI (`.github/workflows/ci.yml`) runs fmt + clippy + test on every PR.
 - **Don't add a CLAUDE.md, README.md, or other doc file unsolicited** — only when the user asks. Same for `// removed X` comments and re-exports for backwards compat.
 - **The `card-snapshots/` and `card-snapshots-linux/` directories are gitignored**. Don't commit them. They're regenerated locally.
 - **Strava OAuth refresh tokens** are stored in plaintext in SQLite. Rotation is automatic on 401. Don't log them.
+- **The AI comment is sent as plain text with no `parse_mode`** — the card caption
+  uses MarkdownV2, which requires escaping `.` `-` `(` `)` `!` `+`. Model output is
+  full of those, and send failures are swallowed, so reusing that parse mode fails
+  silently on nearly every message.
+- **Don't log `AI_API_KEY`** — same rule as Strava refresh tokens. `AiConfig` has a
+  hand-written `Debug` impl that redacts it, because `Config` derives `Debug` and is
+  logged at startup.
