@@ -387,36 +387,59 @@ pub fn get_oldest_activity_date(conn: &Connection, athlete_id: i64) -> Result<Op
         .and_then(|s| NaiveDate::parse_from_str(&s[..10], "%Y-%m-%d").ok()))
 }
 
-pub fn get_latest_activity(conn: &Connection, athlete_id: i64) -> Result<Option<CachedActivity>> {
+/// Shared row → `CachedActivity` mapping for `activity_cache` SELECTs.
+///
+/// Column order must match: `activity_id`, `athlete_id`, `title`, `activity_type`,
+/// `distance_km`, `duration_s`, `pace_sec_per_km`, `start_date_local`, `start_date`, `url`.
+fn row_to_cached(row: &rusqlite::Row) -> rusqlite::Result<CachedActivity> {
+    Ok(CachedActivity {
+        activity_id: row.get(0)?,
+        athlete_id: row.get(1)?,
+        title: row.get(2)?,
+        activity_type: {
+            let at_str: String = row.get(3)?;
+            ActivityType::from_str(&at_str).unwrap_or(ActivityType::Other)
+        },
+        distance_km: row.get(4)?,
+        duration_s: row.get(5)?,
+        pace_sec_per_km: row.get(6)?,
+        start_date_local: row.get(7)?,
+        start_date: row.get::<_, Option<String>>(8)?.unwrap_or_default(),
+        url: row.get(9)?,
+    })
+}
+
+/// An athlete's most recent cached activities, newest first.
+///
+/// `exclude_id` drops one activity by id — the poller caches an activity
+/// before notifying, so the activity being commented on is already in the
+/// table and would otherwise appear in its own history.
+pub fn get_recent_activities(
+    conn: &Connection,
+    athlete_id: i64,
+    exclude_id: Option<i64>,
+    limit: usize,
+) -> Result<Vec<CachedActivity>> {
     let mut stmt = conn.prepare(
         "SELECT activity_id, athlete_id, title, activity_type, distance_km, duration_s,
                 pace_sec_per_km, start_date_local, start_date, url
          FROM activity_cache
-         WHERE athlete_id = ?1
+         WHERE athlete_id = ?1 AND (?2 IS NULL OR activity_id != ?2)
          ORDER BY start_date_local DESC, activity_id DESC
-         LIMIT 1",
+         LIMIT ?3",
     )?;
-    let mut rows = stmt.query_map(rusqlite::params![athlete_id], |row| {
-        Ok(CachedActivity {
-            activity_id: row.get(0)?,
-            athlete_id: row.get(1)?,
-            title: row.get(2)?,
-            activity_type: {
-                let at_str: String = row.get(3)?;
-                ActivityType::from_str(&at_str).unwrap_or(ActivityType::Other)
-            },
-            distance_km: row.get(4)?,
-            duration_s: row.get(5)?,
-            pace_sec_per_km: row.get(6)?,
-            start_date_local: row.get(7)?,
-            start_date: row.get::<_, Option<String>>(8)?.unwrap_or_default(),
-            url: row.get(9)?,
-        })
-    })?;
-    match rows.next() {
-        Some(result) => Ok(Some(result?)),
-        None => Ok(None),
-    }
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let rows = stmt.query_map(
+        rusqlite::params![athlete_id, exclude_id, limit],
+        row_to_cached,
+    )?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+pub fn get_latest_activity(conn: &Connection, athlete_id: i64) -> Result<Option<CachedActivity>> {
+    Ok(get_recent_activities(conn, athlete_id, None, 1)?
+        .into_iter()
+        .next())
 }
 
 /// Most recent true-UTC `start_date` across an athlete's cached activities.
@@ -1121,5 +1144,91 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn test_get_recent_activities_newest_first_and_excludes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path().join("t.db").to_str().unwrap()).unwrap();
+        db.run(|conn| {
+            upsert_athlete(conn, 1, "alice", "a", "r", 0)?;
+            for (id, day) in [(10, "01"), (11, "02"), (12, "03")] {
+                cache_activity(
+                    conn,
+                    &CachedActivity {
+                        activity_id: id,
+                        athlete_id: 1,
+                        title: format!("Run {}", id),
+                        activity_type: ActivityType::Run,
+                        distance_km: 5.0,
+                        duration_s: 1500,
+                        pace_sec_per_km: Some(300),
+                        start_date_local: format!("2026-08-{}T08:00:00Z", day),
+                        start_date: format!("2026-08-{}T08:00:00Z", day),
+                        url: "u".into(),
+                    },
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        // Newest first, current activity excluded.
+        let got = db
+            .run(|conn| get_recent_activities(conn, 1, Some(12), 10))
+            .unwrap();
+        let ids: Vec<i64> = got.iter().map(|a| a.activity_id).collect();
+        assert_eq!(ids, vec![11, 10]);
+    }
+
+    #[test]
+    fn test_get_recent_activities_respects_limit_and_athlete() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path().join("t.db").to_str().unwrap()).unwrap();
+        db.run(|conn| {
+            upsert_athlete(conn, 1, "alice", "a", "r", 0)?;
+            upsert_athlete(conn, 2, "bob", "a", "r", 0)?;
+            for (id, athlete, day) in [(10, 1, "01"), (11, 1, "02"), (20, 2, "03")] {
+                cache_activity(
+                    conn,
+                    &CachedActivity {
+                        activity_id: id,
+                        athlete_id: athlete,
+                        title: "Run".into(),
+                        activity_type: ActivityType::Run,
+                        distance_km: 5.0,
+                        duration_s: 1500,
+                        pace_sec_per_km: Some(300),
+                        start_date_local: format!("2026-08-{}T08:00:00Z", day),
+                        start_date: format!("2026-08-{}T08:00:00Z", day),
+                        url: "u".into(),
+                    },
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        let got = db
+            .run(|conn| get_recent_activities(conn, 1, None, 1))
+            .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].activity_id, 11);
+
+        // Bob's activity never appears in Alice's history.
+        let all = db
+            .run(|conn| get_recent_activities(conn, 1, None, 50))
+            .unwrap();
+        assert!(all.iter().all(|a| a.athlete_id == 1));
+    }
+
+    #[test]
+    fn test_get_recent_activities_empty_for_unknown_athlete() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path().join("t.db").to_str().unwrap()).unwrap();
+        let got = db
+            .run(|conn| get_recent_activities(conn, 999, None, 10))
+            .unwrap();
+        assert!(got.is_empty());
     }
 }
