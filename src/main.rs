@@ -1,3 +1,4 @@
+pub mod ai;
 pub mod card;
 pub mod commands;
 pub mod config;
