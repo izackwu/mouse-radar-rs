@@ -1,6 +1,13 @@
-use crate::db::CachedActivity;
+use std::sync::Arc;
+
+use anyhow::Result;
+use log::{debug, warn};
+
+use crate::ai::AiClient;
+use crate::config::AiConfig;
+use crate::db::{self, CachedActivity, Db};
 use crate::formatting::{format_duration, format_pace};
-use crate::strava::StravaActivityDetail;
+use crate::strava::{StravaActivityDetail, StravaApi};
 
 /// Persona and guardrails for the comment. Overridable via `AI_SYSTEM_PROMPT`.
 ///
@@ -218,6 +225,71 @@ pub fn sanitize(raw: &str, max_chars: usize) -> Option<String> {
     }
     out.push('…');
     Some(out)
+}
+
+/// Produce the comment text for an activity, or `None` if there is nothing
+/// worth sending.
+///
+/// Deliberately does not send: keeping the send out of this function is what
+/// makes the whole path testable without a Telegram fake.
+///
+/// Errors from the AI client propagate; the caller logs and drops them. The
+/// notification has already been delivered by the time this runs, so no
+/// failure here is user-visible.
+#[allow(clippy::too_many_arguments)]
+pub async fn compose_comment(
+    ai: &Arc<dyn AiClient>,
+    strava: &Arc<dyn StravaApi>,
+    db: &Arc<Db>,
+    cfg: &AiConfig,
+    access_token: &str,
+    athlete_name: &str,
+    activity: &CachedActivity,
+) -> Result<Option<String>> {
+    // History, excluding the activity being commented on — the poller caches
+    // before notifying, so it is already in the table.
+    let history = {
+        let db = Arc::clone(db);
+        let athlete_id = activity.athlete_id;
+        let exclude = activity.activity_id;
+        let limit = cfg.history_limit;
+        tokio::task::spawn_blocking(move || {
+            db.run(|conn| db::get_recent_activities(conn, athlete_id, Some(exclude), limit))
+        })
+        .await??
+    };
+
+    if history.is_empty() {
+        debug!(
+            "No prior activities for {}; skipping AI comment",
+            athlete_name
+        );
+        return Ok(None);
+    }
+
+    // Best-effort: a missing detail degrades the prompt, it does not fail it.
+    let detail = match strava
+        .get_activity_detail(access_token, activity.activity_id)
+        .await
+    {
+        Ok(d) => Some(d),
+        Err(e) => {
+            warn!(
+                "Activity detail fetch failed for {} ({}): {}. Continuing without it.",
+                athlete_name, activity.activity_id, e
+            );
+            None
+        }
+    };
+
+    let user = build_user_message(athlete_name, activity, detail.as_ref(), &history);
+    let system = cfg
+        .system_prompt
+        .as_deref()
+        .unwrap_or(DEFAULT_SYSTEM_PROMPT);
+
+    let raw = ai.comment(system, &user).await?;
+    Ok(sanitize(&raw, cfg.max_chars))
 }
 
 #[cfg(test)]
