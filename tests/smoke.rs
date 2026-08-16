@@ -33,6 +33,14 @@ impl StravaApi for MockStrava {
     ) -> anyhow::Result<Vec<StravaActivity>> {
         Ok(self.activities.clone())
     }
+
+    async fn get_activity_detail(
+        &self,
+        _access_token: &str,
+        _activity_id: i64,
+    ) -> anyhow::Result<mouse_radar_rs::strava::StravaActivityDetail> {
+        Ok(mouse_radar_rs::strava::StravaActivityDetail::default())
+    }
 }
 
 #[tokio::test]
