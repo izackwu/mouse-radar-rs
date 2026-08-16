@@ -414,10 +414,21 @@ fn row_to_cached(row: &rusqlite::Row) -> rusqlite::Result<CachedActivity> {
 /// `exclude_id` drops one activity by id — the poller caches an activity
 /// before notifying, so the activity being commented on is already in the
 /// table and would otherwise appear in its own history.
+///
+/// `before_local` additionally bounds the result to activities strictly
+/// earlier than the given `start_date_local`. This matters because the
+/// poller caches an activity before it notifies (see `exclude_id` above),
+/// and does so via `spawn_blocking` with no ordering barrier against the
+/// already-spawned AI-comment task for a PREVIOUS activity: both hit the
+/// blocking pool concurrently. Without this bound, an older activity's
+/// history query can race ahead of the notification for a newer one and
+/// pick it up as "recent history" — even though `exclude_id` alone would
+/// let it through, since it isn't the activity being excluded.
 pub fn get_recent_activities(
     conn: &Connection,
     athlete_id: i64,
     exclude_id: Option<i64>,
+    before_local: Option<&str>,
     limit: usize,
 ) -> Result<Vec<CachedActivity>> {
     let mut stmt = conn.prepare(
@@ -425,19 +436,20 @@ pub fn get_recent_activities(
                 pace_sec_per_km, start_date_local, start_date, url
          FROM activity_cache
          WHERE athlete_id = ?1 AND (?2 IS NULL OR activity_id != ?2)
+           AND (?4 IS NULL OR start_date_local < ?4)
          ORDER BY start_date_local DESC, activity_id DESC
          LIMIT ?3",
     )?;
     let limit = i64::try_from(limit).unwrap_or(i64::MAX);
     let rows = stmt.query_map(
-        rusqlite::params![athlete_id, exclude_id, limit],
+        rusqlite::params![athlete_id, exclude_id, limit, before_local],
         row_to_cached,
     )?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 pub fn get_latest_activity(conn: &Connection, athlete_id: i64) -> Result<Option<CachedActivity>> {
-    Ok(get_recent_activities(conn, athlete_id, None, 1)?
+    Ok(get_recent_activities(conn, athlete_id, None, None, 1)?
         .into_iter()
         .next())
 }
@@ -1175,10 +1187,56 @@ mod tests {
 
         // Newest first, current activity excluded.
         let got = db
-            .run(|conn| get_recent_activities(conn, 1, Some(12), 10))
+            .run(|conn| get_recent_activities(conn, 1, Some(12), None, 10))
             .unwrap();
         let ids: Vec<i64> = got.iter().map(|a| a.activity_id).collect();
         assert_eq!(ids, vec![11, 10]);
+    }
+
+    #[test]
+    fn test_get_recent_activities_before_local_excludes_not_yet_announced() {
+        // Regression test: the poller caches an activity before notifying it,
+        // and the AI-comment task for an OLDER activity can run concurrently
+        // with the cache write for a NEWER one. Without a `before_local`
+        // bound, the older activity's "recent history" query could pick up
+        // an activity that hasn't been posted to the chat yet. `before_local`
+        // must exclude anything at or after the activity being commented on,
+        // independent of `exclude_id`.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path().join("t.db").to_str().unwrap()).unwrap();
+        db.run(|conn| {
+            upsert_athlete(conn, 1, "alice", "a", "r", 0)?;
+            for (id, day) in [
+                (1, "10"), // last week's run — should remain visible
+                (2, "17"), // Monday — the activity being commented on
+                (3, "19"), // Wednesday — cached early by the race, not yet notified
+                (4, "21"), // Friday — cached early by the race, not yet notified
+            ] {
+                cache_activity(
+                    conn,
+                    &CachedActivity {
+                        activity_id: id,
+                        athlete_id: 1,
+                        title: format!("Run {}", id),
+                        activity_type: ActivityType::Run,
+                        distance_km: 5.0,
+                        duration_s: 1500,
+                        pace_sec_per_km: Some(300),
+                        start_date_local: format!("2026-08-{}T08:00:00Z", day),
+                        start_date: format!("2026-08-{}T08:00:00Z", day),
+                        url: "u".into(),
+                    },
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        let got = db
+            .run(|conn| get_recent_activities(conn, 1, Some(2), Some("2026-08-17T08:00:00Z"), 10))
+            .unwrap();
+        let ids: Vec<i64> = got.iter().map(|a| a.activity_id).collect();
+        assert_eq!(ids, vec![1]);
     }
 
     #[test]
@@ -1210,14 +1268,14 @@ mod tests {
         .unwrap();
 
         let got = db
-            .run(|conn| get_recent_activities(conn, 1, None, 1))
+            .run(|conn| get_recent_activities(conn, 1, None, None, 1))
             .unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].activity_id, 11);
 
         // Bob's activity never appears in Alice's history.
         let all = db
-            .run(|conn| get_recent_activities(conn, 1, None, 50))
+            .run(|conn| get_recent_activities(conn, 1, None, None, 50))
             .unwrap();
         assert!(all.iter().all(|a| a.athlete_id == 1));
     }
@@ -1227,7 +1285,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(dir.path().join("t.db").to_str().unwrap()).unwrap();
         let got = db
-            .run(|conn| get_recent_activities(conn, 999, None, 10))
+            .run(|conn| get_recent_activities(conn, 999, None, None, 10))
             .unwrap();
         assert!(got.is_empty());
     }
