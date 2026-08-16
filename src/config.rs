@@ -127,24 +127,6 @@ impl Config {
     }
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            telegram_bot_token: String::new(),
-            telegram_chat_id: String::new(),
-            strava_client_id: String::new(),
-            strava_client_secret: String::new(),
-            poll_interval_seconds: 300,
-            cold_start_lookback_days: 30,
-            database_path: "./data/bot.db".into(),
-            bot_admin_usernames: Vec::new(),
-            tracked_activity_types: Vec::new(),
-            notification_mode: NotificationMode::CardAndText,
-            ai: None,
-        }
-    }
-}
-
 fn parse_env_default<T: std::str::FromStr>(key: &str, default: T) -> T {
     env::var(key)
         .ok()
