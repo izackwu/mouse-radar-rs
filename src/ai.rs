@@ -40,18 +40,42 @@ struct ChatChoice {
 
 #[derive(Deserialize)]
 struct ChatResponseMessage {
-    content: String,
+    /// Some OpenAI-compatible providers send `"content": null` (e.g. a tool
+    /// call with no text). `sanitize` already treats an empty string as "no
+    /// comment", so `None` degrades cleanly instead of failing the parse.
+    #[serde(default)]
+    content: Option<String>,
 }
 
 fn endpoint(base_url: &str) -> String {
     format!("{}/chat/completions", base_url.trim_end_matches('/'))
 }
 
+/// Cap on upstream error-body text embedded in log lines.
+///
+/// Bounds two things: an unbounded dump when a misconfigured `AI_BASE_URL`
+/// returns an HTML error page, and — the more serious case — a proxy or
+/// self-hosted gateway that echoes the request (including the `Authorization`
+/// header) back in a 4xx body, which would otherwise put `AI_API_KEY` in the
+/// log via `comment.rs`'s `warn!`.
+const MAX_LOGGED_ERROR_BODY_CHARS: usize = 200;
+
+/// Truncate by `char`, not byte: a byte-index cut can land mid-codepoint on
+/// multi-byte UTF-8 (e.g. CJK) and panic.
+fn truncate_for_log(s: &str) -> String {
+    if s.chars().count() <= MAX_LOGGED_ERROR_BODY_CHARS {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(MAX_LOGGED_ERROR_BODY_CHARS).collect();
+    out.push('…');
+    out
+}
+
 fn first_choice(resp: ChatResponse) -> Result<String> {
     resp.choices
         .into_iter()
         .next()
-        .map(|c| c.message.content)
+        .map(|c| c.message.content.unwrap_or_default())
         .ok_or_else(|| anyhow::anyhow!("AI response contained no choices"))
 }
 
@@ -117,7 +141,7 @@ impl AiClient for OpenAiCompatClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("AI API error ({}): {}", status, text);
+            anyhow::bail!("AI API error ({}): {}", status, truncate_for_log(&text));
         }
 
         first_choice(resp.json().await?)
@@ -185,5 +209,34 @@ mod tests {
     fn test_response_with_no_choices_errors() {
         let parsed: ChatResponse = serde_json::from_str(r#"{"choices": []}"#).unwrap();
         assert!(first_choice(parsed).is_err());
+    }
+
+    #[test]
+    fn test_response_with_null_content_treated_as_empty() {
+        // Several OpenAI-compatible providers return `"content": null` (e.g.
+        // when the model calls a tool or emits nothing). It must degrade to
+        // an empty string rather than failing the whole parse and dropping
+        // the comment.
+        let body = r#"{
+            "choices": [
+                {"message": {"role": "assistant", "content": null}}
+            ]
+        }"#;
+        let parsed: ChatResponse = serde_json::from_str(body).unwrap();
+        assert_eq!(first_choice(parsed).unwrap(), "");
+    }
+
+    #[test]
+    fn test_truncate_for_log_caps_at_200_chars_by_char_not_byte() {
+        // Multi-byte characters must not panic on a byte-index truncation.
+        let s: String = "日".repeat(300);
+        let out = truncate_for_log(&s);
+        assert_eq!(out.chars().count(), 201); // 200 chars + ellipsis
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn test_truncate_for_log_passthrough_when_short() {
+        assert_eq!(truncate_for_log("short body"), "short body");
     }
 }

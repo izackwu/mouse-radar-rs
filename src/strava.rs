@@ -1,9 +1,16 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::Deserialize;
+use std::time::Duration;
 
 use crate::db::CachedActivity;
 use crate::types::ActivityType;
+
+/// HTTP timeout for all Strava API calls. Without one, a stalled connection
+/// never fails: the detached AI-comment task (see `comment::spawn_comment`)
+/// would hang forever holding an `Arc<Db>`, a `Bot`, and a cloned `AiConfig`,
+/// and the "detail fetch fails → degrade" path would never trigger.
+const STRAVA_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
 // --- OAuth types ---
 
@@ -138,8 +145,12 @@ pub struct StravaClient {
 impl StravaClient {
     #[must_use]
     pub fn new(client_id: String, client_secret: String) -> Self {
+        let http = reqwest::Client::builder()
+            .timeout(STRAVA_HTTP_TIMEOUT)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
-            http: reqwest::Client::new(),
+            http,
             client_id,
             client_secret,
         }
