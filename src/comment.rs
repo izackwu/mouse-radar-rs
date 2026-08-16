@@ -62,6 +62,21 @@ fn opt_signed(v: Option<f64>) -> String {
     v.map_or_else(|| "—".to_string(), |n| format!("{:+.0}", n))
 }
 
+/// Render a `CachedActivity.start_date_local` for the prompt as
+/// `YYYY-MM-DD HH:MM local`, dropping Strava's misleading `Z` suffix.
+///
+/// `start_date_local` is local wall-clock time wearing a UTC costume (see
+/// CLAUDE.md) — this reformats the string as-is, with no timezone
+/// arithmetic, so the model does not read the `Z` and reason about it as
+/// UTC. Falls back to the raw string for anything shorter than the expected
+/// `YYYY-MM-DDTHH:MM...` prefix rather than panicking.
+fn format_local_display(start_date_local: &str) -> String {
+    match (start_date_local.get(..10), start_date_local.get(11..16)) {
+        (Some(date), Some(time)) => format!("{} {} local", date, time),
+        _ => start_date_local.to_string(),
+    }
+}
+
 /// Build the user half of the prompt: the activity, its detail, and the
 /// athlete's recent history.
 #[must_use]
@@ -77,7 +92,9 @@ pub fn build_user_message(
     s.push_str("THIS ACTIVITY\n");
     s.push_str(&format!(
         "  {} \"{}\" — {}\n",
-        activity.activity_type, activity.title, activity.start_date_local
+        activity.activity_type,
+        activity.title,
+        format_local_display(&activity.start_date_local)
     ));
     match activity.pace_sec_per_km {
         Some(p) => s.push_str(&format!(
@@ -180,9 +197,9 @@ pub fn build_user_message(
 
     if history.len() <= THIN_HISTORY_THRESHOLD {
         let (count, verb) = if history.len() == 1 {
-            ("1 prior activity", "is")
+            ("1 prior activity".to_string(), "is")
         } else {
-            ("2 prior activities", "are")
+            (format!("{} prior activities", history.len()), "are")
         };
         s.push_str(&format!(
             "\nNOTE: only {} {} on record for this athlete.\n\
@@ -238,7 +255,6 @@ pub fn sanitize(raw: &str, max_chars: usize) -> Option<String> {
 /// Errors from the AI client propagate; the caller logs and drops them. The
 /// notification has already been delivered by the time this runs, so no
 /// failure here is user-visible.
-#[allow(clippy::too_many_arguments)]
 pub async fn compose_comment(
     ai: &Arc<dyn AiClient>,
     strava: &Arc<dyn StravaApi>,
@@ -249,14 +265,27 @@ pub async fn compose_comment(
     activity: &CachedActivity,
 ) -> Result<Option<String>> {
     // History, excluding the activity being commented on — the poller caches
-    // before notifying, so it is already in the table.
+    // before notifying, so it is already in the table. Also bounded by
+    // `before_local`: the poller's cache-then-notify writes for later
+    // activities race this task on the blocking pool with no ordering
+    // barrier, so `exclude_id` alone is not enough to keep a not-yet-notified
+    // activity out of this history (see `get_recent_activities`).
     let history = {
         let db = Arc::clone(db);
         let athlete_id = activity.athlete_id;
         let exclude = activity.activity_id;
+        let before_local = activity.start_date_local.clone();
         let limit = cfg.history_limit;
         tokio::task::spawn_blocking(move || {
-            db.run(|conn| db::get_recent_activities(conn, athlete_id, Some(exclude), limit))
+            db.run(|conn| {
+                db::get_recent_activities(
+                    conn,
+                    athlete_id,
+                    Some(exclude),
+                    Some(&before_local),
+                    limit,
+                )
+            })
         })
         .await??
     };
@@ -396,6 +425,59 @@ mod tests {
             (1..=5).map(|i| act(90 + i, "10", 8.0, Some(320))).collect();
         assert!(
             !build_user_message("Zack", &current, None, &thick).contains("do not describe trends")
+        );
+    }
+
+    #[test]
+    fn test_thin_history_hint_boundary_is_exactly_two() {
+        // Pins THIN_HISTORY_THRESHOLD == 2 exactly: fires at len == 2, does
+        // not fire at len == 3. The len == 1 / len == 5 cases above would
+        // pass unchanged for a threshold of 1, 2, 3, or 4.
+        let current = act(99, "16", 12.4, Some(312));
+
+        let two: Vec<CachedActivity> = (1..=2).map(|i| act(90 + i, "10", 8.0, Some(320))).collect();
+        assert!(build_user_message("Zack", &current, None, &two).contains("do not describe trends"));
+
+        let three: Vec<CachedActivity> =
+            (1..=3).map(|i| act(90 + i, "10", 8.0, Some(320))).collect();
+        assert!(
+            !build_user_message("Zack", &current, None, &three).contains("do not describe trends")
+        );
+    }
+
+    #[test]
+    fn test_zero_history_note_is_factually_correct() {
+        // `build_user_message` is `pub` with no documented precondition
+        // against empty history, even though `compose_comment` currently
+        // early-returns before calling it with one. The note must not claim
+        // "2 prior activities" when there are zero.
+        let current = act(99, "16", 12.4, Some(312));
+        let msg = build_user_message("Zack", &current, None, &[]);
+
+        assert!(msg.contains("RECENT HISTORY (newest first — 0 activities)"));
+        assert!(msg.contains("0 prior activities are on record"));
+        assert!(!msg.contains("2 prior activities"));
+    }
+
+    #[test]
+    fn test_activity_start_date_rendered_as_local_no_z_suffix() {
+        // Strava mislabels start_date_local with a trailing `Z`, which reads
+        // as UTC. This is the one place that raw string reaches the model;
+        // it must be reformatted as "YYYY-MM-DD HH:MM local" instead.
+        let current = act(99, "16", 12.4, Some(312));
+        let msg = build_user_message("Zack", &current, None, &[]);
+
+        assert!(msg.contains("2026-08-16 06:28 local"));
+        assert!(!msg.contains("2026-08-16T06:28:00Z"));
+    }
+
+    #[test]
+    fn test_format_local_display_handles_malformed_input_without_panicking() {
+        assert_eq!(format_local_display(""), "");
+        assert_eq!(format_local_display("short"), "short");
+        assert_eq!(
+            format_local_display("2026-08-16T06:28:00Z"),
+            "2026-08-16 06:28 local"
         );
     }
 

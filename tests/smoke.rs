@@ -15,6 +15,10 @@ use mouse_radar_rs::types::ActivityType;
 struct MockStrava {
     activities: Vec<StravaActivity>,
     token_response: Option<TokenResponse>,
+    /// When true, `get_activity_detail` fails — exercises the
+    /// "Strava detail fetch fails → degrade to summary + history prompt,
+    /// still comment" path.
+    fail_detail: bool,
 }
 
 #[async_trait]
@@ -42,6 +46,9 @@ impl StravaApi for MockStrava {
         _access_token: &str,
         _activity_id: i64,
     ) -> anyhow::Result<mouse_radar_rs::strava::StravaActivityDetail> {
+        if self.fail_detail {
+            anyhow::bail!("stub detail fetch failure");
+        }
         Ok(mouse_radar_rs::strava::StravaActivityDetail::default())
     }
 }
@@ -76,6 +83,7 @@ async fn test_full_pipeline_with_mock() {
             expires_at: 9_999_999_999,
             expires_in: 21600,
         }),
+        fail_detail: false,
     });
 
     let strava_client: Arc<dyn StravaApi> = mock;
@@ -255,6 +263,7 @@ async fn test_compose_comment_returns_text() {
     let strava: Arc<dyn StravaApi> = Arc::new(MockStrava {
         activities: vec![],
         token_response: None,
+        fail_detail: false,
     });
 
     let got = comment::compose_comment(
@@ -289,6 +298,7 @@ async fn test_compose_comment_skips_when_no_history() {
     let strava: Arc<dyn StravaApi> = Arc::new(MockStrava {
         activities: vec![],
         token_response: None,
+        fail_detail: false,
     });
 
     let got = comment::compose_comment(
@@ -319,6 +329,7 @@ async fn test_compose_comment_propagates_ai_failure() {
     let strava: Arc<dyn StravaApi> = Arc::new(MockStrava {
         activities: vec![],
         token_response: None,
+        fail_detail: false,
     });
 
     let got = comment::compose_comment(
@@ -349,6 +360,7 @@ async fn test_compose_comment_skips_blank_completion() {
     let strava: Arc<dyn StravaApi> = Arc::new(MockStrava {
         activities: vec![],
         token_response: None,
+        fail_detail: false,
     });
 
     let got = comment::compose_comment(
@@ -364,4 +376,39 @@ async fn test_compose_comment_skips_blank_completion() {
     .unwrap();
 
     assert_eq!(got, None);
+}
+
+#[tokio::test]
+async fn test_compose_comment_degrades_when_strava_detail_fetch_fails() {
+    // Spec's error table: "Strava detail fetch fails -> degrade to summary +
+    // history prompt, still comment." A failing `get_activity_detail` must
+    // not abort compose_comment — it should fall back to the summary +
+    // history prompt and still produce a comment.
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(Db::open(dir.path().join("t.db").to_str().unwrap()).unwrap());
+    let current = seed_db_with_history(&db, 5);
+
+    let ai: Arc<dyn AiClient> = Arc::new(StubAi {
+        response: "Solid effort out there.".into(),
+        fail: false,
+    });
+    let strava: Arc<dyn StravaApi> = Arc::new(MockStrava {
+        activities: vec![],
+        token_response: None,
+        fail_detail: true,
+    });
+
+    let got = comment::compose_comment(
+        &ai,
+        &strava,
+        &db,
+        &test_ai_config(),
+        "acc",
+        "zack",
+        &current,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(got, Some("Solid effort out there.".to_string()));
 }
