@@ -26,7 +26,10 @@ src/
 │                  # Also listens on an mpsc channel for PollCommand (e.g. /auth
 │                  # triggers an immediate ColdStart poll for that athlete)
 ├── commands.rs    # teloxide Command enum (typed args) + handlers (/register /auth
-│                  # /strava /latest …); malformed commands get a usage-hint reply
+│                  # /strava /latest /aicomment …); malformed commands get a
+│                  # usage-hint reply. /aicomment is admin-only and runs an
+│                  # athlete's latest activity through the real comment path,
+│                  # replying with the comment AND the prompt that produced it
 ├── formatting.rs  # pace, duration, distance formatters shared by message text + card
 ├── types.rs       # ActivityType enum (Run / TrailRun / Ride / Hike / Walk / Swim / Other)
 └── card.rs        # SVG → PNG card renderer. The trickiest file in the repo — see below
