@@ -39,8 +39,12 @@ pub enum Command {
     },
     /// Show the latest activity for an athlete with card image. Usage: /latest <name>
     Latest(String),
-    /// Run an athlete's latest activity through the AI commenter (admin only). Usage: /aicomment <name>
-    Aicomment(String),
+    // `hide` keeps this out of /help. Teloxide applies the same filter to
+    // `bot_commands()`, so `usage_for` can't find it either — a malformed
+    // invocation gets no usage hint. Acceptable for an admin debug command.
+    /// Run an athlete's latest activity through the AI commenter (admin only). Usage: /test-ai-comment <name>
+    #[command(rename = "test-ai-comment", hide)]
+    TestAiComment(String),
 }
 
 /// Usage line for a message that looks like one of our commands but failed to
@@ -68,7 +72,7 @@ pub struct AppState {
     pub config: Config,
     pub db: Arc<Db>,
     pub poll_tx: tokio::sync::mpsc::UnboundedSender<crate::poller::PollCommand>,
-    /// Shared with the poller so `/aicomment` runs the same client production
+    /// Shared with the poller so `/test-ai-comment` runs the same client production
     /// does. `None` when `AI_API_KEY` is unset.
     pub ai: Option<Arc<dyn crate::ai::AiClient>>,
     pub strava: Arc<dyn crate::strava::StravaApi>,
@@ -111,7 +115,7 @@ pub async fn handle_command(
             code,
         } => cmd_auth(bot, msg, name, strava_id, code, state).await,
         Command::Latest(name) => cmd_latest(bot, msg, name, state).await,
-        Command::Aicomment(name) => cmd_aicomment(bot, msg, name, state).await,
+        Command::TestAiComment(name) => cmd_test_ai_comment(bot, msg, name, state).await,
     }
 }
 
@@ -400,7 +404,7 @@ const TELEGRAM_CHUNK_CHARS: usize = 3900;
 /// Admin-only, and deliberately routed through `comment::compose_comment` —
 /// the same function the poller uses — so what this prints is what production
 /// would produce, not a parallel debug implementation.
-async fn cmd_aicomment(
+async fn cmd_test_ai_comment(
     bot: Bot,
     msg: Message,
     name: String,
@@ -524,7 +528,7 @@ async fn cmd_aicomment(
         .await?;
     }
 
-    info!("/aicomment run for {} by admin", athlete.name);
+    info!("/test-ai-comment run for {} by admin", athlete.name);
     Ok(())
 }
 
@@ -563,21 +567,32 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_aicomment() {
-        let cmd = Command::parse("/aicomment zack", "testbot").unwrap();
+    fn test_parse_test_ai_comment() {
+        // `hide` must not affect parsing — only visibility.
+        let cmd = Command::parse("/test-ai-comment zack", "testbot").unwrap();
         match cmd {
-            Command::Aicomment(name) => assert_eq!(name, "zack"),
-            _ => panic!("expected Aicomment"),
+            Command::TestAiComment(name) => assert_eq!(name, "zack"),
+            _ => panic!("expected TestAiComment"),
         }
     }
 
     #[test]
-    fn test_aicomment_usage_hint_marks_it_admin_only() {
-        // The doc comment doubles as /help text and as the malformed-command
-        // usage reply, so the admin restriction must be visible there.
-        let usage = usage_for("/aicomment", "testbot").expect("known command");
-        assert!(usage.contains("admin only"), "usage was: {}", usage);
-        assert!(usage.contains("/aicomment <name>"), "usage was: {}", usage);
+    fn test_test_ai_comment_is_hidden_from_help() {
+        let help = Command::descriptions().to_string();
+        assert!(!help.contains("test-ai-comment"), "help was: {}", help);
+        // The visible commands are still listed.
+        assert!(help.contains("/latest"), "help was: {}", help);
+    }
+
+    #[test]
+    fn test_hidden_command_gets_no_usage_hint() {
+        // Teloxide filters `bot_commands()` on the same predicate as
+        // `descriptions()`, so hiding the command also removes it from the
+        // list `usage_for` searches. Documenting the consequence: a malformed
+        // invocation is silently ignored rather than answered with a hint.
+        assert!(usage_for("/test-ai-comment", "testbot").is_none());
+        // A visible command still gets its hint.
+        assert!(usage_for("/register", "testbot").is_some());
     }
 
     #[test]

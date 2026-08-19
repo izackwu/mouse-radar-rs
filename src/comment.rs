@@ -249,7 +249,7 @@ pub fn sanitize(raw: &str, max_chars: usize) -> Option<String> {
 /// The result of composing a comment: the prompt that was built, and the
 /// comment the model produced from it.
 ///
-/// The prompt is carried out of the function so the `/aicomment` admin
+/// The prompt is carried out of the function so the `/test-ai-comment` admin
 /// command can show what the model actually saw. Production only reads
 /// `comment`.
 #[derive(Debug, Clone)]
