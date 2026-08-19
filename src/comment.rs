@@ -246,6 +246,28 @@ pub fn sanitize(raw: &str, max_chars: usize) -> Option<String> {
     Some(out)
 }
 
+/// The result of composing a comment: the prompt that was built, and the
+/// comment the model produced from it.
+///
+/// The prompt is carried out of the function so the `/aicomment` admin
+/// command can show what the model actually saw. Production only reads
+/// `comment`.
+#[derive(Debug, Clone)]
+pub struct Composed {
+    /// The user half of the prompt. `None` when composition stopped before a
+    /// prompt was built — currently only when the athlete has no prior
+    /// activities to compare against.
+    pub prompt: Option<String>,
+    /// The sanitized comment. `None` when composition was skipped, or when
+    /// the model returned nothing usable.
+    pub comment: Option<String>,
+    /// Whether Strava activity detail (splits, laps, best efforts) made it
+    /// into the prompt. False means the fetch failed and the prompt fell back
+    /// to summary + history — useful to surface when testing, since a stale
+    /// access token produces a thinner comment that can look like a bug.
+    pub had_detail: bool,
+}
+
 /// Produce the comment text for an activity, or `None` if there is nothing
 /// worth sending.
 ///
@@ -263,7 +285,7 @@ pub async fn compose_comment(
     access_token: &str,
     athlete_name: &str,
     activity: &CachedActivity,
-) -> Result<Option<String>> {
+) -> Result<Composed> {
     // History, excluding the activity being commented on — the poller caches
     // before notifying, so it is already in the table. Also bounded by
     // `before_local`: the poller's cache-then-notify writes for later
@@ -295,7 +317,11 @@ pub async fn compose_comment(
             "No prior activities for {}; skipping AI comment",
             athlete_name
         );
-        return Ok(None);
+        return Ok(Composed {
+            prompt: None,
+            comment: None,
+            had_detail: false,
+        });
     }
 
     // Best-effort: a missing detail degrades the prompt, it does not fail it.
@@ -320,7 +346,55 @@ pub async fn compose_comment(
         .unwrap_or(DEFAULT_SYSTEM_PROMPT);
 
     let raw = ai.comment(system, &user).await?;
-    Ok(sanitize(&raw, cfg.max_chars))
+    Ok(Composed {
+        comment: sanitize(&raw, cfg.max_chars),
+        had_detail: detail.is_some(),
+        prompt: Some(user),
+    })
+}
+
+/// Split text into chunks that each fit within Telegram's message limit.
+///
+/// Breaks on line boundaries so prompt tables stay readable. A single line
+/// longer than `limit` is hard-split by character count rather than dropped.
+#[must_use]
+pub fn chunk_text(text: &str, limit: usize) -> Vec<String> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    if text.chars().count() <= limit {
+        return vec![text.to_string()];
+    }
+
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+
+    for line in text.split_inclusive('\n') {
+        // A single line that cannot fit anywhere: flush, then hard-split it.
+        if line.chars().count() > limit {
+            if !current.is_empty() {
+                chunks.push(std::mem::take(&mut current));
+            }
+            let mut rest: Vec<char> = line.chars().collect();
+            while rest.len() > limit {
+                let tail = rest.split_off(limit);
+                chunks.push(rest.into_iter().collect());
+                rest = tail;
+            }
+            current = rest.into_iter().collect();
+            continue;
+        }
+
+        if current.chars().count() + line.chars().count() > limit {
+            chunks.push(std::mem::take(&mut current));
+        }
+        current.push_str(line);
+    }
+
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
 }
 
 /// Fire-and-forget: generate the comment and post it as a threaded reply.
@@ -352,8 +426,11 @@ pub fn spawn_comment(
         )
         .await
         {
-            Ok(Some(text)) => text,
-            Ok(None) => return,
+            Ok(Composed {
+                comment: Some(text),
+                ..
+            }) => text,
+            Ok(_) => return,
             Err(e) => {
                 warn!("AI comment failed for {}: {}", athlete_name, e);
                 return;
@@ -616,5 +693,49 @@ mod tests {
         let out = sanitize("supercalifragilistic", 10).unwrap();
         assert!(out.ends_with('…'));
         assert!(out.chars().count() <= 10);
+    }
+
+    #[test]
+    fn test_chunk_text_under_limit_is_single_chunk() {
+        let chunks = chunk_text("one\ntwo\n", 100);
+        assert_eq!(chunks, vec!["one\ntwo\n".to_string()]);
+    }
+
+    #[test]
+    fn test_chunk_text_splits_on_line_boundaries() {
+        // Each line is 6 chars including the newline; a limit of 12 fits two.
+        let text = "aaaaa\nbbbbb\nccccc\nddddd\n";
+        let chunks = chunk_text(text, 12);
+
+        assert_eq!(chunks, vec!["aaaaa\nbbbbb\n", "ccccc\nddddd\n"]);
+        // Nothing is lost or duplicated in the split.
+        assert_eq!(chunks.concat(), text);
+        assert!(chunks.iter().all(|c| c.chars().count() <= 12));
+    }
+
+    #[test]
+    fn test_chunk_text_hard_splits_an_overlong_line() {
+        // A single line longer than the limit must be split, not dropped.
+        let text = format!("short\n{}\n", "x".repeat(25));
+        let chunks = chunk_text(&text, 10);
+
+        assert!(chunks.iter().all(|c| c.chars().count() <= 10));
+        assert_eq!(chunks.concat(), text);
+    }
+
+    #[test]
+    fn test_chunk_text_counts_by_char_not_byte() {
+        // 20 CJK chars = 60 bytes. Chunking by byte would split mid-character
+        // and panic; chunking by char must not.
+        let text = "走".repeat(20);
+        let chunks = chunk_text(&text, 8);
+
+        assert!(chunks.iter().all(|c| c.chars().count() <= 8));
+        assert_eq!(chunks.concat(), text);
+    }
+
+    #[test]
+    fn test_chunk_text_zero_limit_is_empty() {
+        assert!(chunk_text("anything", 0).is_empty());
     }
 }

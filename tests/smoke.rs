@@ -279,9 +279,15 @@ async fn test_compose_comment_returns_text() {
     .unwrap();
 
     assert_eq!(
-        got,
+        got.comment,
         Some("Third run this week and the longest yet.".to_string())
     );
+    // The prompt is carried out alongside the comment so `/aicomment` can
+    // show what the model actually saw.
+    let prompt = got.prompt.expect("prompt returned with the comment");
+    assert!(prompt.contains("ATHLETE: zack"));
+    assert!(prompt.contains("RECENT HISTORY"));
+    assert!(got.had_detail);
 }
 
 #[tokio::test]
@@ -313,7 +319,9 @@ async fn test_compose_comment_skips_when_no_history() {
     .await
     .unwrap();
 
-    assert_eq!(got, None);
+    // Skipped before a prompt was ever built.
+    assert_eq!(got.comment, None);
+    assert_eq!(got.prompt, None);
 }
 
 #[tokio::test]
@@ -375,7 +383,9 @@ async fn test_compose_comment_skips_blank_completion() {
     .await
     .unwrap();
 
-    assert_eq!(got, None);
+    // No usable comment, but the prompt that produced it is still returned.
+    assert_eq!(got.comment, None);
+    assert!(got.prompt.is_some());
 }
 
 #[tokio::test]
@@ -410,5 +420,7 @@ async fn test_compose_comment_degrades_when_strava_detail_fetch_fails() {
     .await
     .unwrap();
 
-    assert_eq!(got, Some("Solid effort out there.".to_string()));
+    assert_eq!(got.comment, Some("Solid effort out there.".to_string()));
+    // Detail was unavailable, and that fact is reported rather than hidden.
+    assert!(!got.had_detail);
 }
