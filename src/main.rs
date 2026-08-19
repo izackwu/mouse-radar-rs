@@ -58,6 +58,8 @@ async fn main() -> anyhow::Result<()> {
         config: config.clone(),
         db: Arc::clone(&db),
         poll_tx,
+        ai: ai_client.clone(),
+        strava: Arc::clone(&strava_client),
     });
 
     // Command handler — commands go to handle_command; our commands with bad

@@ -39,6 +39,8 @@ pub enum Command {
     },
     /// Show the latest activity for an athlete with card image. Usage: /latest <name>
     Latest(String),
+    /// Run an athlete's latest activity through the AI commenter (admin only). Usage: /aicomment <name>
+    Aicomment(String),
 }
 
 /// Usage line for a message that looks like one of our commands but failed to
@@ -66,6 +68,10 @@ pub struct AppState {
     pub config: Config,
     pub db: Arc<Db>,
     pub poll_tx: tokio::sync::mpsc::UnboundedSender<crate::poller::PollCommand>,
+    /// Shared with the poller so `/aicomment` runs the same client production
+    /// does. `None` when `AI_API_KEY` is unset.
+    pub ai: Option<Arc<dyn crate::ai::AiClient>>,
+    pub strava: Arc<dyn crate::strava::StravaApi>,
 }
 
 #[must_use]
@@ -105,6 +111,7 @@ pub async fn handle_command(
             code,
         } => cmd_auth(bot, msg, name, strava_id, code, state).await,
         Command::Latest(name) => cmd_latest(bot, msg, name, state).await,
+        Command::Aicomment(name) => cmd_aicomment(bot, msg, name, state).await,
     }
 }
 
@@ -383,6 +390,144 @@ async fn cmd_latest(
     Ok(())
 }
 
+/// Telegram rejects messages over 4096 characters. Leave headroom for the
+/// chunk header we prepend.
+const TELEGRAM_CHUNK_CHARS: usize = 3900;
+
+/// Run an athlete's latest cached activity through the real comment path and
+/// reply with both the comment and the prompt that produced it.
+///
+/// Admin-only, and deliberately routed through `comment::compose_comment` —
+/// the same function the poller uses — so what this prints is what production
+/// would produce, not a parallel debug implementation.
+async fn cmd_aicomment(
+    bot: Bot,
+    msg: Message,
+    name: String,
+    state: Arc<AppState>,
+) -> ResponseResult<()> {
+    if !is_admin(&msg, &state.config) {
+        bot.send_message(msg.chat.id, "This command is restricted to admin users.")
+            .await?;
+        return Ok(());
+    }
+
+    let (Some(ai), Some(ai_cfg)) = (state.ai.as_ref(), state.config.ai.as_ref()) else {
+        bot.send_message(
+            msg.chat.id,
+            "AI comments are disabled (AI_API_KEY not set).",
+        )
+        .await?;
+        return Ok(());
+    };
+
+    // Resolve the athlete and their latest cached activity in one DB hop.
+    let db = Arc::clone(&state.db);
+    let name_clone = name.clone();
+    let found = tokio::task::spawn_blocking(move || {
+        db.run(|conn| {
+            let athletes = db::list_athletes(conn)?;
+            let Some(athlete) = athletes
+                .iter()
+                .find(|a| a.name.eq_ignore_ascii_case(&name_clone))
+            else {
+                return Ok(None);
+            };
+            let activity = db::get_latest_activity(conn, athlete.strava_id)?;
+            Ok(Some((athlete.clone(), activity)))
+        })
+    })
+    .await
+    .map_err(|e| {
+        log::error!("DB join error: {}", e);
+        to_request_error(e)
+    })?
+    .map_err(|e| {
+        log::error!("DB error: {}", e);
+        to_request_error(e)
+    })?;
+
+    let (athlete, activity) = match found {
+        Some((athlete, Some(activity))) => (athlete, activity),
+        Some((_, None)) => {
+            bot.send_message(
+                msg.chat.id,
+                format!("No cached activities found for '{}'.", name),
+            )
+            .await?;
+            return Ok(());
+        }
+        None => {
+            bot.send_message(msg.chat.id, format!("Athlete '{}' not found.", name))
+                .await?;
+            return Ok(());
+        }
+    };
+
+    // Note: unlike the poller, this path does not refresh an expiring token.
+    // A stale token makes the detail fetch fail, which degrades the prompt
+    // rather than failing it — `had_detail` below reports when that happened.
+    let composed = match crate::comment::compose_comment(
+        ai,
+        &state.strava,
+        &state.db,
+        ai_cfg,
+        &athlete.access_token,
+        &athlete.name,
+        &activity,
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            log::error!("AI comment failed for {}: {}", athlete.name, e);
+            bot.send_message(msg.chat.id, format!("AI comment failed: {}", e))
+                .await?;
+            return Ok(());
+        }
+    };
+
+    let Some(prompt) = composed.prompt else {
+        bot.send_message(
+            msg.chat.id,
+            format!(
+                "Skipped: no prior activities for '{}' to compare against.",
+                athlete.name
+            ),
+        )
+        .await?;
+        return Ok(());
+    };
+
+    // Plain text throughout — model output contains characters MarkdownV2
+    // would reject, and a rejected message would be silently lost.
+    let header = if composed.had_detail {
+        String::new()
+    } else {
+        "\n\n⚠️ Strava activity detail was unavailable (stale token?), so the \
+         prompt has no splits or laps."
+            .to_string()
+    };
+    let comment = composed
+        .comment
+        .unwrap_or_else(|| "(model returned nothing usable)".to_string());
+    bot.send_message(msg.chat.id, format!("🤖 {}{}", comment, header))
+        .await?;
+
+    let chunks = crate::comment::chunk_text(&prompt, TELEGRAM_CHUNK_CHARS);
+    let total = chunks.len();
+    for (i, chunk) in chunks.into_iter().enumerate() {
+        bot.send_message(
+            msg.chat.id,
+            format!("─── prompt ({}/{}) ───\n{}", i + 1, total, chunk),
+        )
+        .await?;
+    }
+
+    info!("/aicomment run for {} by admin", athlete.name);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::float_cmp)]
@@ -415,6 +560,24 @@ mod tests {
             }
             _ => panic!("expected Auth"),
         }
+    }
+
+    #[test]
+    fn test_parse_aicomment() {
+        let cmd = Command::parse("/aicomment zack", "testbot").unwrap();
+        match cmd {
+            Command::Aicomment(name) => assert_eq!(name, "zack"),
+            _ => panic!("expected Aicomment"),
+        }
+    }
+
+    #[test]
+    fn test_aicomment_usage_hint_marks_it_admin_only() {
+        // The doc comment doubles as /help text and as the malformed-command
+        // usage reply, so the admin restriction must be visible there.
+        let usage = usage_for("/aicomment", "testbot").expect("known command");
+        assert!(usage.contains("admin only"), "usage was: {}", usage);
+        assert!(usage.contains("/aicomment <name>"), "usage was: {}", usage);
     }
 
     #[test]
