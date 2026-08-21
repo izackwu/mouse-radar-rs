@@ -410,13 +410,21 @@ async fn cmd_test_ai_comment(
     name: String,
     state: Arc<AppState>,
 ) -> ResponseResult<()> {
+    let invoker = sender_username(&msg);
     if !is_admin(&msg, &state.config) {
+        log::warn!(
+            "/test-ai-comment denied for non-admin '{}' (target '{}')",
+            invoker,
+            name
+        );
         bot.send_message(msg.chat.id, "This command is restricted to admin users.")
             .await?;
         return Ok(());
     }
+    info!("/test-ai-comment invoked by '{}' for '{}'", invoker, name);
 
     let (Some(ai), Some(ai_cfg)) = (state.ai.as_ref(), state.config.ai.as_ref()) else {
+        log::warn!("/test-ai-comment requested but AI is not configured");
         bot.send_message(
             msg.chat.id,
             "AI comments are disabled (AI_API_KEY not set).",
@@ -452,7 +460,13 @@ async fn cmd_test_ai_comment(
     })?;
 
     let (athlete, activity) = match found {
-        Some((athlete, Some(activity))) => (athlete, activity),
+        Some((athlete, Some(activity))) => {
+            info!(
+                "/test-ai-comment resolved {} -> activity {} \"{}\" ({})",
+                athlete.name, activity.activity_id, activity.title, activity.start_date_local
+            );
+            (athlete, activity)
+        }
         Some((_, None)) => {
             bot.send_message(
                 msg.chat.id,
@@ -512,23 +526,46 @@ async fn cmd_test_ai_comment(
          prompt has no splits or laps."
             .to_string()
     };
-    let comment = composed
-        .comment
-        .unwrap_or_else(|| "(model returned nothing usable)".to_string());
-    bot.send_message(msg.chat.id, format!("🤖 {}{}", comment, header))
-        .await?;
+    let comment = composed.comment.unwrap_or_else(|| {
+        // compose_comment has already logged the model diagnostics
+        // (finish_reason, token usage, raw body) that explain this.
+        "(model returned nothing usable — see logs for finish_reason)".to_string()
+    });
+    if let Err(e) = bot
+        .send_message(msg.chat.id, format!("🤖 {}{}", comment, header))
+        .await
+    {
+        log::error!("Failed to send comment message for {}: {}", athlete.name, e);
+    }
 
+    // Send failures are logged per chunk rather than aborting the loop: one
+    // rejected chunk should not swallow the rest of the prompt.
     let chunks = crate::comment::chunk_text(&prompt, TELEGRAM_CHUNK_CHARS);
     let total = chunks.len();
     for (i, chunk) in chunks.into_iter().enumerate() {
-        bot.send_message(
-            msg.chat.id,
-            format!("─── prompt ({}/{}) ───\n{}", i + 1, total, chunk),
-        )
-        .await?;
+        if let Err(e) = bot
+            .send_message(
+                msg.chat.id,
+                format!("─── prompt ({}/{}) ───\n{}", i + 1, total, chunk),
+            )
+            .await
+        {
+            log::error!(
+                "Failed to send prompt chunk {}/{} for {}: {}",
+                i + 1,
+                total,
+                athlete.name,
+                e
+            );
+        }
     }
 
-    info!("/test-ai-comment run for {} by admin", athlete.name);
+    info!(
+        "/test-ai-comment complete for {} ({} prompt chars, {} chunks)",
+        athlete.name,
+        prompt.chars().count(),
+        total
+    );
     Ok(())
 }
 

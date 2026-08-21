@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use log::{debug, warn};
+use log::{debug, info, warn};
 use teloxide::prelude::*;
 use teloxide::types::{MessageId, ReplyParameters};
 
@@ -10,6 +10,7 @@ use crate::config::AiConfig;
 use crate::db::{self, CachedActivity, Db};
 use crate::formatting::{format_duration, format_pace};
 use crate::strava::{StravaActivityDetail, StravaApi};
+use crate::types::ActivityType;
 
 /// Persona and guardrails for the comment. Overridable via `AI_SYSTEM_PROMPT`.
 ///
@@ -60,6 +61,31 @@ fn opt_num(v: Option<f64>) -> String {
 
 fn opt_signed(v: Option<f64>) -> String {
     v.map_or_else(|| "—".to_string(), |n| format!("{:+.0}", n))
+}
+
+/// Convert Strava's reported cadence into the units the prompt claims.
+///
+/// For foot sports Strava reports RPM — one revolution is one stride, i.e.
+/// two steps — so a reported 90 is really 180 spm. Cycling cadence is genuine
+/// pedal RPM and is passed through untouched.
+fn cadence_for(activity_type: ActivityType, raw: f64) -> (f64, &'static str) {
+    if activity_type.cadence_is_per_leg() {
+        (raw * 2.0, "spm")
+    } else {
+        (raw, "rpm")
+    }
+}
+
+/// Flatten an activity title for a single table cell.
+///
+/// Strava titles are free text and may contain newlines, which would break
+/// the aligned history table the model reads.
+fn flatten_title(title: &str) -> String {
+    let flat: String = title
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    flat.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Render a `CachedActivity.start_date_local` for the prompt as
@@ -123,7 +149,8 @@ pub fn build_user_message(
             extras.push(format!("max HR {:.0}", hr));
         }
         if let Some(c) = d.average_cadence {
-            extras.push(format!("cadence {:.0}", c));
+            let (value, unit) = cadence_for(activity.activity_type, c);
+            extras.push(format!("cadence {:.0} {}", value, unit));
         }
         if !extras.is_empty() {
             s.push_str(&format!("  {}\n", extras.join(" · ")));
@@ -155,17 +182,28 @@ pub fn build_user_message(
         }
 
         if !d.laps.is_empty() {
+            let cad_unit = if activity.activity_type.cadence_is_per_leg() {
+                "spm"
+            } else {
+                "rpm"
+            };
             s.push_str("\n  LAPS\n");
-            s.push_str("    #    dist      pace   avgHR  maxHR  cad   elev\n");
+            s.push_str(&format!(
+                "    #    dist      pace   avgHR  maxHR  cad({})  elev\n",
+                cad_unit
+            ));
             for lap in &d.laps {
+                let cadence = lap
+                    .average_cadence
+                    .map(|c| cadence_for(activity.activity_type, c).0);
                 s.push_str(&format!(
-                    "    {:<4} {:>5.2} km  {:>5}  {:>5}  {:>5}  {:>4}  {:>5}\n",
+                    "    {:<4} {:>5.2} km  {:>5}  {:>5}  {:>5}  {:>8}  {:>5}\n",
                     lap.lap_index,
                     lap.distance / 1000.0,
                     opt_pace(lap.average_speed),
                     opt_num(lap.average_heartrate),
                     opt_num(lap.max_heartrate),
-                    opt_num(lap.average_cadence),
+                    opt_num(cadence),
                     opt_signed(lap.total_elevation_gain),
                 ));
             }
@@ -176,22 +214,24 @@ pub fn build_user_message(
         "\nRECENT HISTORY (newest first — {} activities)\n",
         history.len()
     ));
+    s.push_str("  date        type       distance      pace   duration  title\n");
     for h in history {
         let date = h.start_date_local.get(..10).unwrap_or(&h.start_date_local);
         let pace = h
             .pace_sec_per_km
             .map_or_else(|| "—".to_string(), format_pace);
-        // Bind to a String first: column padding (`{:<6}`) is only honoured by
-        // Display impls that route through `f.pad`, which strum's derive does
-        // not guarantee. `String`'s impl does.
+        // Bind to a String first: column padding (`{:<10}`) is only honoured
+        // by Display impls that route through `f.pad`, which strum's derive
+        // does not guarantee. `String`'s impl does.
         let kind = h.activity_type.to_string();
         s.push_str(&format!(
-            "  {}  {:<6} {:>6.1} km  {:>7}  {}\n",
+            "  {}  {:<10} {:>6.1} km  {:>7}  {:>8}  {}\n",
             date,
             kind,
             h.distance_km,
             pace,
             format_duration(h.duration_s),
+            flatten_title(&h.title),
         ));
     }
 
@@ -345,9 +385,33 @@ pub async fn compose_comment(
         .as_deref()
         .unwrap_or(DEFAULT_SYSTEM_PROMPT);
 
-    let raw = ai.comment(system, &user).await?;
+    debug!(
+        "Composing comment for {}: {} history rows, detail={}, prompt {} chars",
+        athlete_name,
+        history.len(),
+        detail.is_some(),
+        user.chars().count()
+    );
+
+    let response = ai.comment(system, &user).await?;
+    let comment = sanitize(&response.content, cfg.max_chars);
+
+    if comment.is_none() {
+        warn!(
+            "No usable comment for {} ({}): {}",
+            athlete_name,
+            activity.activity_id,
+            response.diagnostics()
+        );
+    } else {
+        info!(
+            "Comment composed for {} ({})",
+            athlete_name, activity.activity_id
+        );
+    }
+
     Ok(Composed {
-        comment: sanitize(&raw, cfg.max_chars),
+        comment,
         had_detail: detail.is_some(),
         prompt: Some(user),
     })
@@ -591,6 +655,60 @@ mod tests {
         assert!(msg.contains("elevation 240 m"));
         assert!(!msg.contains("avg HR"));
         assert!(!msg.contains("cadence"));
+    }
+
+    #[test]
+    fn test_run_cadence_is_doubled_to_steps_per_minute() {
+        // Strava reports foot-sport cadence per leg: 90 rpm == 180 spm.
+        let detail = StravaActivityDetail {
+            average_cadence: Some(89.5),
+            ..StravaActivityDetail::default()
+        };
+        let msg = build_user_message(
+            "Zack",
+            &act(99, "16", 12.4, Some(312)),
+            Some(&detail),
+            &[act(98, "14", 8.0, None)],
+        );
+        assert!(msg.contains("cadence 179 spm"), "msg was: {}", msg);
+    }
+
+    #[test]
+    fn test_ride_cadence_is_not_doubled() {
+        // Cycling cadence is genuine pedal RPM and must pass through as-is.
+        let mut ride = act(99, "16", 40.0, None);
+        ride.activity_type = ActivityType::Ride;
+        let detail = StravaActivityDetail {
+            average_cadence: Some(88.0),
+            ..StravaActivityDetail::default()
+        };
+        let msg = build_user_message("Zack", &ride, Some(&detail), &[act(98, "14", 8.0, None)]);
+        assert!(msg.contains("cadence 88 rpm"), "msg was: {}", msg);
+    }
+
+    #[test]
+    fn test_history_has_column_headers_and_titles() {
+        let mut prior = act(98, "14", 8.0, Some(327));
+        prior.title = "Easy shakeout".into();
+        let msg = build_user_message("Zack", &act(99, "16", 12.4, Some(312)), None, &[prior]);
+
+        assert!(msg.contains("date"), "msg was: {}", msg);
+        assert!(msg.contains("distance"), "msg was: {}", msg);
+        assert!(msg.contains("title"), "msg was: {}", msg);
+        assert!(msg.contains("Easy shakeout"), "msg was: {}", msg);
+    }
+
+    #[test]
+    fn test_history_title_newlines_do_not_break_the_table() {
+        let mut prior = act(98, "14", 8.0, Some(327));
+        prior.title = "Morning\nrun\twith friends".into();
+        let msg = build_user_message("Zack", &act(99, "16", 12.4, Some(312)), None, &[prior]);
+
+        assert!(msg.contains("Morning run with friends"), "msg was: {}", msg);
+        // One line per history row, plus the header — the title must not
+        // introduce extra rows.
+        let rows = msg.lines().filter(|l| l.contains("2026-08-14")).count();
+        assert_eq!(rows, 1, "msg was: {}", msg);
     }
 
     #[test]

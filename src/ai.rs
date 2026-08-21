@@ -1,7 +1,48 @@
 use anyhow::Result;
 use async_trait::async_trait;
+use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
+
+/// What the model returned, plus the diagnostics needed to explain an empty
+/// completion.
+///
+/// `content` alone cannot distinguish "the model had nothing to say" from
+/// "the model was cut off before it emitted anything" — a real failure mode
+/// with reasoning models, which spend the token budget on hidden reasoning
+/// and then return `finish_reason: "length"` with empty content.
+#[derive(Debug, Clone, Default)]
+pub struct AiResponse {
+    pub content: String,
+    /// `"stop"`, `"length"`, `"content_filter"`, … Provider-specific.
+    pub finish_reason: Option<String>,
+    pub prompt_tokens: Option<u32>,
+    pub completion_tokens: Option<u32>,
+    /// Non-visible reasoning tokens, when the provider reports them. A large
+    /// value with empty content is the signature of a starved reasoning model.
+    pub reasoning_tokens: Option<u32>,
+}
+
+impl AiResponse {
+    /// One-line diagnostic summary, safe to log and to show an admin.
+    #[must_use]
+    pub fn diagnostics(&self) -> String {
+        let mut parts = vec![format!("chars={}", self.content.chars().count())];
+        if let Some(r) = &self.finish_reason {
+            parts.push(format!("finish_reason={}", r));
+        }
+        if let Some(t) = self.prompt_tokens {
+            parts.push(format!("prompt_tokens={}", t));
+        }
+        if let Some(t) = self.completion_tokens {
+            parts.push(format!("completion_tokens={}", t));
+        }
+        if let Some(t) = self.reasoning_tokens {
+            parts.push(format!("reasoning_tokens={}", t));
+        }
+        parts.join(" ")
+    }
+}
 
 /// A one-shot text completion service.
 ///
@@ -9,7 +50,7 @@ use std::time::Duration;
 /// `strava::StravaApi` pattern.
 #[async_trait]
 pub trait AiClient: Send + Sync {
-    async fn comment(&self, system: &str, user: &str) -> Result<String>;
+    async fn comment(&self, system: &str, user: &str) -> Result<AiResponse>;
 }
 
 // --- OpenAI-compatible wire format ---
@@ -31,11 +72,31 @@ struct ChatMessage<'a> {
 #[derive(Deserialize)]
 struct ChatResponse {
     choices: Vec<ChatChoice>,
+    #[serde(default)]
+    usage: Option<ChatUsage>,
+}
+
+#[derive(Deserialize)]
+struct ChatUsage {
+    #[serde(default)]
+    prompt_tokens: Option<u32>,
+    #[serde(default)]
+    completion_tokens: Option<u32>,
+    #[serde(default)]
+    completion_tokens_details: Option<ChatUsageDetails>,
+}
+
+#[derive(Deserialize)]
+struct ChatUsageDetails {
+    #[serde(default)]
+    reasoning_tokens: Option<u32>,
 }
 
 #[derive(Deserialize)]
 struct ChatChoice {
     message: ChatResponseMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -71,12 +132,29 @@ fn truncate_for_log(s: &str) -> String {
     out
 }
 
-fn first_choice(resp: ChatResponse) -> Result<String> {
-    resp.choices
+fn first_choice(resp: ChatResponse) -> Result<AiResponse> {
+    let (prompt_tokens, completion_tokens, reasoning_tokens) = match resp.usage {
+        Some(u) => (
+            u.prompt_tokens,
+            u.completion_tokens,
+            u.completion_tokens_details.and_then(|d| d.reasoning_tokens),
+        ),
+        None => (None, None, None),
+    };
+
+    let choice = resp
+        .choices
         .into_iter()
         .next()
-        .map(|c| c.message.content.unwrap_or_default())
-        .ok_or_else(|| anyhow::anyhow!("AI response contained no choices"))
+        .ok_or_else(|| anyhow::anyhow!("AI response contained no choices"))?;
+
+    Ok(AiResponse {
+        content: choice.message.content.unwrap_or_default(),
+        finish_reason: choice.finish_reason,
+        prompt_tokens,
+        completion_tokens,
+        reasoning_tokens,
+    })
 }
 
 // --- Real implementation ---
@@ -91,6 +169,7 @@ pub struct OpenAiCompatClient {
     base_url: String,
     model: String,
     api_key: String,
+    max_tokens: u32,
 }
 
 impl OpenAiCompatClient {
@@ -99,19 +178,21 @@ impl OpenAiCompatClient {
         model: String,
         api_key: String,
         timeout: Duration,
+        max_tokens: u32,
     ) -> Result<Self> {
         Ok(Self {
             http: reqwest::Client::builder().timeout(timeout).build()?,
             base_url,
             model,
             api_key,
+            max_tokens,
         })
     }
 }
 
 #[async_trait]
 impl AiClient for OpenAiCompatClient {
-    async fn comment(&self, system: &str, user: &str) -> Result<String> {
+    async fn comment(&self, system: &str, user: &str) -> Result<AiResponse> {
         let body = ChatRequest {
             model: &self.model,
             messages: vec![
@@ -124,10 +205,19 @@ impl AiClient for OpenAiCompatClient {
                     content: user,
                 },
             ],
-            max_tokens: 150,
+            max_tokens: self.max_tokens,
             temperature: 0.8,
         };
 
+        debug!(
+            "AI request: model={} max_tokens={} system_chars={} user_chars={}",
+            self.model,
+            self.max_tokens,
+            system.chars().count(),
+            user.chars().count()
+        );
+
+        let started = std::time::Instant::now();
         let resp = self
             .http
             .post(endpoint(&self.base_url))
@@ -144,7 +234,43 @@ impl AiClient for OpenAiCompatClient {
             anyhow::bail!("AI API error ({}): {}", status, truncate_for_log(&text));
         }
 
-        first_choice(resp.json().await?)
+        // Read as text first so a shape we can't deserialize is still
+        // reportable — otherwise an unexpected schema fails with a serde
+        // message that names a field but never shows the body.
+        let raw = resp.text().await?;
+        let parsed: ChatResponse = serde_json::from_str(&raw).map_err(|e| {
+            anyhow::anyhow!(
+                "AI response did not parse ({}): {}",
+                e,
+                truncate_for_log(&raw)
+            )
+        })?;
+
+        let out = first_choice(parsed)?;
+        let elapsed_ms = started.elapsed().as_millis();
+
+        if out.content.trim().is_empty() {
+            // The failure mode that produced "(model returned nothing
+            // usable)" in production. Log loudly with everything needed to
+            // tell a starved reasoning model from a filtered completion.
+            warn!(
+                "AI returned empty content in {}ms: model={} {} — raw: {}",
+                elapsed_ms,
+                self.model,
+                out.diagnostics(),
+                truncate_for_log(&raw)
+            );
+        } else {
+            info!(
+                "AI responded in {}ms: model={} {}",
+                elapsed_ms,
+                self.model,
+                out.diagnostics()
+            );
+            debug!("AI content: {}", out.content);
+        }
+
+        Ok(out)
     }
 }
 
@@ -202,7 +328,7 @@ mod tests {
             ]
         }"#;
         let parsed: ChatResponse = serde_json::from_str(body).unwrap();
-        assert_eq!(first_choice(parsed).unwrap(), "Nice run.");
+        assert_eq!(first_choice(parsed).unwrap().content, "Nice run.");
     }
 
     #[test]
@@ -223,7 +349,7 @@ mod tests {
             ]
         }"#;
         let parsed: ChatResponse = serde_json::from_str(body).unwrap();
-        assert_eq!(first_choice(parsed).unwrap(), "");
+        assert_eq!(first_choice(parsed).unwrap().content, "");
     }
 
     #[test]

@@ -25,6 +25,11 @@ pub struct AiConfig {
     pub history_limit: usize,
     pub timeout_seconds: u64,
     pub max_chars: usize,
+    /// Upstream generation cap. Generous by default: reasoning models spend
+    /// this budget on hidden reasoning before emitting any visible text, and
+    /// a low value makes them return empty content with
+    /// `finish_reason: "length"`.
+    pub max_tokens: u32,
     pub system_prompt: Option<String>,
 }
 
@@ -37,6 +42,7 @@ impl std::fmt::Debug for AiConfig {
             .field("history_limit", &self.history_limit)
             .field("timeout_seconds", &self.timeout_seconds)
             .field("max_chars", &self.max_chars)
+            .field("max_tokens", &self.max_tokens)
             .field(
                 "system_prompt",
                 &self.system_prompt.as_ref().map(|_| "<custom>"),
@@ -62,6 +68,7 @@ impl AiConfig {
             history_limit: parse_env_default("AI_HISTORY_LIMIT", 30),
             timeout_seconds: parse_env_default("AI_TIMEOUT_SECONDS", 20),
             max_chars: parse_env_default("AI_MAX_CHARS", 280),
+            max_tokens: parse_env_default("AI_MAX_TOKENS", 1000),
             system_prompt: env::var("AI_SYSTEM_PROMPT")
                 .ok()
                 .filter(|s| !s.trim().is_empty()),
@@ -323,6 +330,7 @@ mod tests {
             history_limit: 30,
             timeout_seconds: 20,
             max_chars: 280,
+            max_tokens: 1000,
             system_prompt: Some("custom persona".into()),
         };
         let rendered = format!("{:?}", ai);

@@ -58,6 +58,20 @@ impl ActivityType {
         }
     }
 
+    /// Whether this is a foot sport, where Strava's `average_cadence` is
+    /// per-leg and must be doubled to get steps per minute.
+    ///
+    /// Strava reports running cadence in RPM (one revolution = one stride =
+    /// two steps), so a reported 90 is really 180 spm. Cycling cadence is
+    /// genuine pedal RPM and must NOT be doubled.
+    #[must_use]
+    pub fn cadence_is_per_leg(self) -> bool {
+        matches!(
+            self,
+            Self::Run | Self::TrailRun | Self::VirtualRun | Self::Hike | Self::Walk
+        )
+    }
+
     #[must_use]
     pub fn has_pace(self) -> bool {
         matches!(
