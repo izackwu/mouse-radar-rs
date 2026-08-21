@@ -3,6 +3,9 @@
 use async_trait::async_trait;
 use std::sync::Arc;
 
+use mouse_radar_rs::ai::AiClient;
+use mouse_radar_rs::comment;
+use mouse_radar_rs::config::AiConfig;
 use mouse_radar_rs::db::{self, CachedActivity, Db};
 use mouse_radar_rs::formatting;
 use mouse_radar_rs::strava::{StravaActivity, StravaApi, StravaAthleteSummary, TokenResponse};
@@ -12,6 +15,10 @@ use mouse_radar_rs::types::ActivityType;
 struct MockStrava {
     activities: Vec<StravaActivity>,
     token_response: Option<TokenResponse>,
+    /// When true, `get_activity_detail` fails — exercises the
+    /// "Strava detail fetch fails → degrade to summary + history prompt,
+    /// still comment" path.
+    fail_detail: bool,
 }
 
 #[async_trait]
@@ -32,6 +39,17 @@ impl StravaApi for MockStrava {
         _per_page: u32,
     ) -> anyhow::Result<Vec<StravaActivity>> {
         Ok(self.activities.clone())
+    }
+
+    async fn get_activity_detail(
+        &self,
+        _access_token: &str,
+        _activity_id: i64,
+    ) -> anyhow::Result<mouse_radar_rs::strava::StravaActivityDetail> {
+        if self.fail_detail {
+            anyhow::bail!("stub detail fetch failure");
+        }
+        Ok(mouse_radar_rs::strava::StravaActivityDetail::default())
     }
 }
 
@@ -65,6 +83,7 @@ async fn test_full_pipeline_with_mock() {
             expires_at: 9_999_999_999,
             expires_in: 21600,
         }),
+        fail_detail: false,
     });
 
     let strava_client: Arc<dyn StravaApi> = mock;
@@ -160,4 +179,248 @@ fn test_cache_survives_reopen() {
             .unwrap();
         assert_eq!(latest.title, "Run");
     }
+}
+
+/// Stub AI client: returns a canned completion, or fails on demand.
+struct StubAi {
+    response: String,
+    fail: bool,
+}
+
+#[async_trait]
+impl AiClient for StubAi {
+    async fn comment(&self, _system: &str, _user: &str) -> anyhow::Result<String> {
+        if self.fail {
+            anyhow::bail!("stub failure");
+        }
+        Ok(self.response.clone())
+    }
+}
+
+fn test_ai_config() -> AiConfig {
+    AiConfig {
+        api_key: "k".into(),
+        base_url: "http://localhost".into(),
+        model: "m".into(),
+        history_limit: 30,
+        timeout_seconds: 20,
+        max_chars: 280,
+        system_prompt: None,
+    }
+}
+
+fn seed_db_with_history(db: &Arc<Db>, count: i64) -> CachedActivity {
+    db.run(|conn| db::upsert_athlete(conn, 1, "zack", "acc", "ref", 9_999_999_999))
+        .unwrap();
+    for i in 0..count {
+        db.run(|conn| {
+            db::cache_activity(
+                conn,
+                &CachedActivity {
+                    activity_id: 100 + i,
+                    athlete_id: 1,
+                    title: "Prior".into(),
+                    activity_type: ActivityType::Run,
+                    distance_km: 8.0,
+                    duration_s: 2400,
+                    pace_sec_per_km: Some(300),
+                    start_date_local: format!("2026-08-{:02}T08:00:00Z", i + 1),
+                    start_date: format!("2026-08-{:02}T08:00:00Z", i + 1),
+                    url: "u".into(),
+                },
+            )
+        })
+        .unwrap();
+    }
+
+    let current = CachedActivity {
+        activity_id: 999,
+        athlete_id: 1,
+        title: "Morning shakeout".into(),
+        activity_type: ActivityType::Run,
+        distance_km: 12.4,
+        duration_s: 3872,
+        pace_sec_per_km: Some(312),
+        start_date_local: "2026-08-16T06:28:00Z".into(),
+        start_date: "2026-08-16T06:28:00Z".into(),
+        url: "u".into(),
+    };
+    // The poller caches before notifying, so the current activity is present.
+    db.run(|conn| db::cache_activity(conn, &current)).unwrap();
+    current
+}
+
+#[tokio::test]
+async fn test_compose_comment_returns_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(Db::open(dir.path().join("t.db").to_str().unwrap()).unwrap());
+    let current = seed_db_with_history(&db, 5);
+
+    let ai: Arc<dyn AiClient> = Arc::new(StubAi {
+        response: "  Third run this week and the longest yet.  ".into(),
+        fail: false,
+    });
+    let strava: Arc<dyn StravaApi> = Arc::new(MockStrava {
+        activities: vec![],
+        token_response: None,
+        fail_detail: false,
+    });
+
+    let got = comment::compose_comment(
+        &ai,
+        &strava,
+        &db,
+        &test_ai_config(),
+        "acc",
+        "zack",
+        &current,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        got.comment,
+        Some("Third run this week and the longest yet.".to_string())
+    );
+    // The prompt is carried out alongside the comment so `/aicomment` can
+    // show what the model actually saw.
+    let prompt = got.prompt.expect("prompt returned with the comment");
+    assert!(prompt.contains("ATHLETE: zack"));
+    assert!(prompt.contains("RECENT HISTORY"));
+    assert!(got.had_detail);
+}
+
+#[tokio::test]
+async fn test_compose_comment_skips_when_no_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(Db::open(dir.path().join("t.db").to_str().unwrap()).unwrap());
+    // Zero prior activities: only the current one is cached.
+    let current = seed_db_with_history(&db, 0);
+
+    let ai: Arc<dyn AiClient> = Arc::new(StubAi {
+        response: "should never be used".into(),
+        fail: false,
+    });
+    let strava: Arc<dyn StravaApi> = Arc::new(MockStrava {
+        activities: vec![],
+        token_response: None,
+        fail_detail: false,
+    });
+
+    let got = comment::compose_comment(
+        &ai,
+        &strava,
+        &db,
+        &test_ai_config(),
+        "acc",
+        "zack",
+        &current,
+    )
+    .await
+    .unwrap();
+
+    // Skipped before a prompt was ever built.
+    assert_eq!(got.comment, None);
+    assert_eq!(got.prompt, None);
+}
+
+#[tokio::test]
+async fn test_compose_comment_propagates_ai_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(Db::open(dir.path().join("t.db").to_str().unwrap()).unwrap());
+    let current = seed_db_with_history(&db, 5);
+
+    let ai: Arc<dyn AiClient> = Arc::new(StubAi {
+        response: String::new(),
+        fail: true,
+    });
+    let strava: Arc<dyn StravaApi> = Arc::new(MockStrava {
+        activities: vec![],
+        token_response: None,
+        fail_detail: false,
+    });
+
+    let got = comment::compose_comment(
+        &ai,
+        &strava,
+        &db,
+        &test_ai_config(),
+        "acc",
+        "zack",
+        &current,
+    )
+    .await;
+
+    // The caller logs and drops; the notification is already delivered.
+    assert!(got.is_err());
+}
+
+#[tokio::test]
+async fn test_compose_comment_skips_blank_completion() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(Db::open(dir.path().join("t.db").to_str().unwrap()).unwrap());
+    let current = seed_db_with_history(&db, 5);
+
+    let ai: Arc<dyn AiClient> = Arc::new(StubAi {
+        response: "   \n  ".into(),
+        fail: false,
+    });
+    let strava: Arc<dyn StravaApi> = Arc::new(MockStrava {
+        activities: vec![],
+        token_response: None,
+        fail_detail: false,
+    });
+
+    let got = comment::compose_comment(
+        &ai,
+        &strava,
+        &db,
+        &test_ai_config(),
+        "acc",
+        "zack",
+        &current,
+    )
+    .await
+    .unwrap();
+
+    // No usable comment, but the prompt that produced it is still returned.
+    assert_eq!(got.comment, None);
+    assert!(got.prompt.is_some());
+}
+
+#[tokio::test]
+async fn test_compose_comment_degrades_when_strava_detail_fetch_fails() {
+    // Spec's error table: "Strava detail fetch fails -> degrade to summary +
+    // history prompt, still comment." A failing `get_activity_detail` must
+    // not abort compose_comment — it should fall back to the summary +
+    // history prompt and still produce a comment.
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(Db::open(dir.path().join("t.db").to_str().unwrap()).unwrap());
+    let current = seed_db_with_history(&db, 5);
+
+    let ai: Arc<dyn AiClient> = Arc::new(StubAi {
+        response: "Solid effort out there.".into(),
+        fail: false,
+    });
+    let strava: Arc<dyn StravaApi> = Arc::new(MockStrava {
+        activities: vec![],
+        token_response: None,
+        fail_detail: true,
+    });
+
+    let got = comment::compose_comment(
+        &ai,
+        &strava,
+        &db,
+        &test_ai_config(),
+        "acc",
+        "zack",
+        &current,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(got.comment, Some("Solid effort out there.".to_string()));
+    // Detail was unavailable, and that fact is reported rather than hidden.
+    assert!(!got.had_detail);
 }

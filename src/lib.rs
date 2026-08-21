@@ -1,5 +1,7 @@
+pub mod ai;
 pub mod card;
 pub mod commands;
+pub mod comment;
 pub mod config;
 pub mod db;
 pub mod formatting;

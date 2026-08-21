@@ -39,6 +39,12 @@ pub enum Command {
     },
     /// Show the latest activity for an athlete with card image. Usage: /latest <name>
     Latest(String),
+    // `hide` keeps this out of /help. Teloxide applies the same filter to
+    // `bot_commands()`, so `usage_for` can't find it either — a malformed
+    // invocation gets no usage hint. Acceptable for an admin debug command.
+    /// Run an athlete's latest activity through the AI commenter (admin only). Usage: /test-ai-comment <name>
+    #[command(rename = "test-ai-comment", hide)]
+    TestAiComment(String),
 }
 
 /// Usage line for a message that looks like one of our commands but failed to
@@ -66,6 +72,10 @@ pub struct AppState {
     pub config: Config,
     pub db: Arc<Db>,
     pub poll_tx: tokio::sync::mpsc::UnboundedSender<crate::poller::PollCommand>,
+    /// Shared with the poller so `/test-ai-comment` runs the same client production
+    /// does. `None` when `AI_API_KEY` is unset.
+    pub ai: Option<Arc<dyn crate::ai::AiClient>>,
+    pub strava: Arc<dyn crate::strava::StravaApi>,
 }
 
 #[must_use]
@@ -105,6 +115,7 @@ pub async fn handle_command(
             code,
         } => cmd_auth(bot, msg, name, strava_id, code, state).await,
         Command::Latest(name) => cmd_latest(bot, msg, name, state).await,
+        Command::TestAiComment(name) => cmd_test_ai_comment(bot, msg, name, state).await,
     }
 }
 
@@ -383,6 +394,144 @@ async fn cmd_latest(
     Ok(())
 }
 
+/// Telegram rejects messages over 4096 characters. Leave headroom for the
+/// chunk header we prepend.
+const TELEGRAM_CHUNK_CHARS: usize = 3900;
+
+/// Run an athlete's latest cached activity through the real comment path and
+/// reply with both the comment and the prompt that produced it.
+///
+/// Admin-only, and deliberately routed through `comment::compose_comment` —
+/// the same function the poller uses — so what this prints is what production
+/// would produce, not a parallel debug implementation.
+async fn cmd_test_ai_comment(
+    bot: Bot,
+    msg: Message,
+    name: String,
+    state: Arc<AppState>,
+) -> ResponseResult<()> {
+    if !is_admin(&msg, &state.config) {
+        bot.send_message(msg.chat.id, "This command is restricted to admin users.")
+            .await?;
+        return Ok(());
+    }
+
+    let (Some(ai), Some(ai_cfg)) = (state.ai.as_ref(), state.config.ai.as_ref()) else {
+        bot.send_message(
+            msg.chat.id,
+            "AI comments are disabled (AI_API_KEY not set).",
+        )
+        .await?;
+        return Ok(());
+    };
+
+    // Resolve the athlete and their latest cached activity in one DB hop.
+    let db = Arc::clone(&state.db);
+    let name_clone = name.clone();
+    let found = tokio::task::spawn_blocking(move || {
+        db.run(|conn| {
+            let athletes = db::list_athletes(conn)?;
+            let Some(athlete) = athletes
+                .iter()
+                .find(|a| a.name.eq_ignore_ascii_case(&name_clone))
+            else {
+                return Ok(None);
+            };
+            let activity = db::get_latest_activity(conn, athlete.strava_id)?;
+            Ok(Some((athlete.clone(), activity)))
+        })
+    })
+    .await
+    .map_err(|e| {
+        log::error!("DB join error: {}", e);
+        to_request_error(e)
+    })?
+    .map_err(|e| {
+        log::error!("DB error: {}", e);
+        to_request_error(e)
+    })?;
+
+    let (athlete, activity) = match found {
+        Some((athlete, Some(activity))) => (athlete, activity),
+        Some((_, None)) => {
+            bot.send_message(
+                msg.chat.id,
+                format!("No cached activities found for '{}'.", name),
+            )
+            .await?;
+            return Ok(());
+        }
+        None => {
+            bot.send_message(msg.chat.id, format!("Athlete '{}' not found.", name))
+                .await?;
+            return Ok(());
+        }
+    };
+
+    // Note: unlike the poller, this path does not refresh an expiring token.
+    // A stale token makes the detail fetch fail, which degrades the prompt
+    // rather than failing it — `had_detail` below reports when that happened.
+    let composed = match crate::comment::compose_comment(
+        ai,
+        &state.strava,
+        &state.db,
+        ai_cfg,
+        &athlete.access_token,
+        &athlete.name,
+        &activity,
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            log::error!("AI comment failed for {}: {}", athlete.name, e);
+            bot.send_message(msg.chat.id, format!("AI comment failed: {}", e))
+                .await?;
+            return Ok(());
+        }
+    };
+
+    let Some(prompt) = composed.prompt else {
+        bot.send_message(
+            msg.chat.id,
+            format!(
+                "Skipped: no prior activities for '{}' to compare against.",
+                athlete.name
+            ),
+        )
+        .await?;
+        return Ok(());
+    };
+
+    // Plain text throughout — model output contains characters MarkdownV2
+    // would reject, and a rejected message would be silently lost.
+    let header = if composed.had_detail {
+        String::new()
+    } else {
+        "\n\n⚠️ Strava activity detail was unavailable (stale token?), so the \
+         prompt has no splits or laps."
+            .to_string()
+    };
+    let comment = composed
+        .comment
+        .unwrap_or_else(|| "(model returned nothing usable)".to_string());
+    bot.send_message(msg.chat.id, format!("🤖 {}{}", comment, header))
+        .await?;
+
+    let chunks = crate::comment::chunk_text(&prompt, TELEGRAM_CHUNK_CHARS);
+    let total = chunks.len();
+    for (i, chunk) in chunks.into_iter().enumerate() {
+        bot.send_message(
+            msg.chat.id,
+            format!("─── prompt ({}/{}) ───\n{}", i + 1, total, chunk),
+        )
+        .await?;
+    }
+
+    info!("/test-ai-comment run for {} by admin", athlete.name);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::float_cmp)]
@@ -415,6 +564,35 @@ mod tests {
             }
             _ => panic!("expected Auth"),
         }
+    }
+
+    #[test]
+    fn test_parse_test_ai_comment() {
+        // `hide` must not affect parsing — only visibility.
+        let cmd = Command::parse("/test-ai-comment zack", "testbot").unwrap();
+        match cmd {
+            Command::TestAiComment(name) => assert_eq!(name, "zack"),
+            _ => panic!("expected TestAiComment"),
+        }
+    }
+
+    #[test]
+    fn test_test_ai_comment_is_hidden_from_help() {
+        let help = Command::descriptions().to_string();
+        assert!(!help.contains("test-ai-comment"), "help was: {}", help);
+        // The visible commands are still listed.
+        assert!(help.contains("/latest"), "help was: {}", help);
+    }
+
+    #[test]
+    fn test_hidden_command_gets_no_usage_hint() {
+        // Teloxide filters `bot_commands()` on the same predicate as
+        // `descriptions()`, so hiding the command also removes it from the
+        // list `usage_for` searches. Documenting the consequence: a malformed
+        // invocation is silently ignored rather than answered with a hint.
+        assert!(usage_for("/test-ai-comment", "testbot").is_none());
+        // A visible command still gets its hint.
+        assert!(usage_for("/register", "testbot").is_some());
     }
 
     #[test]
@@ -463,6 +641,7 @@ mod tests {
             database_path: String::new(),
             tracked_activity_types: vec![],
             notification_mode: crate::config::NotificationMode::CardAndText,
+            ai: None,
         };
 
         assert!(config.bot_admin_usernames.iter().any(|a| a == "alice"));

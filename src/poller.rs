@@ -9,6 +9,7 @@ use teloxide::types::{InputFile, ParseMode};
 
 use tokio::sync::mpsc::UnboundedReceiver;
 
+use crate::ai::AiClient;
 use crate::config::{Config, NotificationMode};
 use crate::db::{self, CachedActivity, Db};
 use crate::strava::{to_cached, StravaActivity, StravaApi};
@@ -25,6 +26,7 @@ pub async fn run_poll_cycle(
     db: &Arc<Db>,
     strava: &Arc<dyn StravaApi>,
     bot: &Bot,
+    ai: Option<&Arc<dyn AiClient>>,
 ) -> Result<()> {
     let chat_id: ChatId = ChatId(config.telegram_chat_id.parse()?);
     let athletes = {
@@ -41,7 +43,7 @@ pub async fn run_poll_cycle(
 
     for athlete in &athletes {
         if let Err(e) = process_athlete(
-            config, db, strava, bot, &chat_id, athlete, &tracked, lookback,
+            config, db, strava, bot, &chat_id, athlete, &tracked, lookback, ai,
         )
         .await
         {
@@ -65,6 +67,7 @@ pub async fn run_poll_loop(
     strava: Arc<dyn StravaApi>,
     bot: Bot,
     mut rx: UnboundedReceiver<PollCommand>,
+    ai: Option<Arc<dyn AiClient>>,
 ) {
     let mut interval =
         tokio::time::interval(std::time::Duration::from_secs(config.poll_interval_seconds));
@@ -85,7 +88,7 @@ pub async fn run_poll_loop(
         tokio::select! {
             _ = interval.tick() => {
                 info!("Starting poll cycle...");
-                if let Err(e) = run_poll_cycle(&config, &db, &strava, &bot).await {
+                if let Err(e) = run_poll_cycle(&config, &db, &strava, &bot, ai.as_ref()).await {
                     error!("Poll cycle failed: {}", e);
                 }
             }
@@ -93,7 +96,7 @@ pub async fn run_poll_loop(
                 match cmd {
                     PollCommand::PollAll => {
                         info!("Starting poll cycle (triggered)...");
-                        if let Err(e) = run_poll_cycle(&config, &db, &strava, &bot).await {
+                        if let Err(e) = run_poll_cycle(&config, &db, &strava, &bot, ai.as_ref()).await {
                             error!("Poll cycle failed: {}", e);
                         }
                     }
@@ -122,7 +125,7 @@ pub async fn run_poll_loop(
                         };
                         if let Err(e) = process_athlete(
                             &config, &db, &strava, &bot, &chat_id,
-                            &athlete, &tracked, lookback,
+                            &athlete, &tracked, lookback, ai.as_ref(),
                         ).await {
                             error!("Cold start for {} failed: {}", athlete.name, e);
                         } else {
@@ -145,6 +148,7 @@ pub async fn process_athlete(
     athlete: &db::Athlete,
     tracked_types: &[ActivityType],
     lookback: chrono::Duration,
+    ai: Option<&Arc<dyn AiClient>>,
 ) -> Result<()> {
     // 1. Refresh token if expiring within 1 hour
     let now = Utc::now().timestamp();
@@ -274,10 +278,14 @@ pub async fn process_athlete(
                 NotificationMode::CardOnly | NotificationMode::CardAndText
             );
             let mut delivered = false;
+            let mut reply_to: Option<teloxide::types::MessageId> = None;
 
             if send_text {
                 match bot.send_message(*chat_id, notif.text).await {
-                    Ok(_) => delivered = true,
+                    Ok(m) => {
+                        delivered = true;
+                        reply_to = Some(m.id);
+                    }
                     Err(e) => error!("Failed to send message for {}: {}", athlete.name, e),
                 }
             }
@@ -288,12 +296,33 @@ pub async fn process_athlete(
                     .parse_mode(ParseMode::MarkdownV2)
                     .await
                 {
-                    Ok(_) => delivered = true,
+                    Ok(m) => {
+                        delivered = true;
+                        reply_to = Some(m.id);
+                    }
                     Err(e) => error!("Failed to send card photo for {}: {}", athlete.name, e),
                 }
             }
             if delivered {
                 info!("Notified: {} - {}", athlete.name, cached.title);
+
+                // Comment is best-effort and fully detached: the notification
+                // above is already delivered and cannot be affected.
+                if let (Some(ai), Some(reply_id), Some(ai_cfg)) = (ai, reply_to, config.ai.as_ref())
+                {
+                    crate::comment::spawn_comment(
+                        Arc::clone(ai),
+                        Arc::clone(strava),
+                        Arc::clone(db),
+                        bot.clone(),
+                        *chat_id,
+                        reply_id,
+                        ai_cfg.clone(),
+                        access_token.clone(),
+                        athlete.name.clone(),
+                        cached.clone(),
+                    );
+                }
             }
         }
     }

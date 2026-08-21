@@ -1,9 +1,16 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::Deserialize;
+use std::time::Duration;
 
 use crate::db::CachedActivity;
 use crate::types::ActivityType;
+
+/// HTTP timeout for all Strava API calls. Without one, a stalled connection
+/// never fails: the detached AI-comment task (see `comment::spawn_comment`)
+/// would hang forever holding an `Arc<Db>`, a `Bot`, and a cloned `AiConfig`,
+/// and the "detail fetch fails → degrade" path would never trigger.
+const STRAVA_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
 // --- OAuth types ---
 
@@ -36,6 +43,77 @@ pub struct StravaAthleteSummary {
     pub id: i64,
 }
 
+/// Detailed activity from `GET /activities/{id}`.
+///
+/// Every field is optional: Strava omits keys depending on device, sport
+/// type, and whether the athlete wore a heart-rate strap. Serde defaults
+/// keep an unexpected shape from failing the whole parse.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct StravaActivityDetail {
+    #[serde(default)]
+    pub average_heartrate: Option<f64>,
+    #[serde(default)]
+    pub max_heartrate: Option<f64>,
+    #[serde(default)]
+    pub total_elevation_gain: Option<f64>,
+    #[serde(default)]
+    pub average_cadence: Option<f64>,
+    #[serde(default)]
+    pub splits_metric: Vec<StravaSplit>,
+    #[serde(default)]
+    pub laps: Vec<StravaLap>,
+    #[serde(default)]
+    pub best_efforts: Vec<StravaBestEffort>,
+}
+
+/// One of Strava's uniform per-kilometre splits.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StravaSplit {
+    pub split: i64,
+    pub distance: f64,
+    pub moving_time: i64,
+    pub elapsed_time: i64,
+    #[serde(default)]
+    pub average_speed: Option<f64>,
+    #[serde(default)]
+    pub average_heartrate: Option<f64>,
+    #[serde(default)]
+    pub elevation_difference: Option<f64>,
+}
+
+/// A lap as recorded by the athlete's device — manual button press or
+/// auto-lap. Carries max HR and cadence, which splits do not.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StravaLap {
+    pub lap_index: i64,
+    pub distance: f64,
+    pub moving_time: i64,
+    pub elapsed_time: i64,
+    #[serde(default)]
+    pub average_speed: Option<f64>,
+    #[serde(default)]
+    pub max_speed: Option<f64>,
+    #[serde(default)]
+    pub average_heartrate: Option<f64>,
+    #[serde(default)]
+    pub max_heartrate: Option<f64>,
+    #[serde(default)]
+    pub average_cadence: Option<f64>,
+    #[serde(default)]
+    pub total_elevation_gain: Option<f64>,
+}
+
+/// A standard-distance effort. `pr_rank` is non-null only when the effort is
+/// a top-3 all-time result for that athlete — Strava's own arithmetic, and
+/// the only figure in the prompt the model does not have to compute.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StravaBestEffort {
+    pub name: String,
+    pub elapsed_time: i64,
+    #[serde(default)]
+    pub pr_rank: Option<i64>,
+}
+
 // --- Trait for testability ---
 
 #[async_trait]
@@ -49,6 +127,11 @@ pub trait StravaApi: Send + Sync {
         before: Option<i64>,
         per_page: u32,
     ) -> Result<Vec<StravaActivity>>;
+    async fn get_activity_detail(
+        &self,
+        access_token: &str,
+        activity_id: i64,
+    ) -> Result<StravaActivityDetail>;
 }
 
 // --- Real implementation ---
@@ -62,8 +145,12 @@ pub struct StravaClient {
 impl StravaClient {
     #[must_use]
     pub fn new(client_id: String, client_secret: String) -> Self {
+        let http = reqwest::Client::builder()
+            .timeout(STRAVA_HTTP_TIMEOUT)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
-            http: reqwest::Client::new(),
+            http,
             client_id,
             client_secret,
         }
@@ -145,6 +232,30 @@ impl StravaApi for StravaClient {
 
         Ok(resp.json().await?)
     }
+
+    async fn get_activity_detail(
+        &self,
+        access_token: &str,
+        activity_id: i64,
+    ) -> Result<StravaActivityDetail> {
+        let resp = self
+            .http
+            .get(format!(
+                "https://www.strava.com/api/v3/activities/{}",
+                activity_id
+            ))
+            .header("Authorization", format!("Bearer {}", access_token))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Strava detail API error ({}): {}", status, body);
+        }
+
+        Ok(resp.json().await?)
+    }
 }
 
 // --- Helper to convert StravaActivity -> CachedActivity ---
@@ -220,5 +331,49 @@ mod tests {
 
         let cached = to_cached(&act);
         assert_eq!(cached.pace_sec_per_km, None);
+    }
+
+    #[test]
+    fn test_detail_deserializes_full_payload() {
+        let body = r#"{
+            "average_heartrate": 152.4,
+            "max_heartrate": 171.0,
+            "total_elevation_gain": 240.0,
+            "average_cadence": 89.0,
+            "splits_metric": [
+                {"split": 1, "distance": 1000.0, "moving_time": 331,
+                 "elapsed_time": 331, "average_speed": 3.02,
+                 "average_heartrate": 141.0, "elevation_difference": 12.0}
+            ],
+            "laps": [
+                {"lap_index": 1, "distance": 400.0, "moving_time": 90,
+                 "elapsed_time": 90, "average_speed": 4.44, "max_speed": 5.1,
+                 "average_heartrate": 168.0, "max_heartrate": 174.0,
+                 "average_cadence": 93.0, "total_elevation_gain": 2.0}
+            ],
+            "best_efforts": [
+                {"name": "5k", "elapsed_time": 1264, "pr_rank": 2},
+                {"name": "1k", "elapsed_time": 240, "pr_rank": null}
+            ]
+        }"#;
+        let d: StravaActivityDetail = serde_json::from_str(body).unwrap();
+        assert_eq!(d.max_heartrate, Some(171.0));
+        assert_eq!(d.splits_metric.len(), 1);
+        assert_eq!(d.splits_metric[0].average_heartrate, Some(141.0));
+        assert_eq!(d.laps.len(), 1);
+        assert_eq!(d.laps[0].max_heartrate, Some(174.0));
+        assert_eq!(d.best_efforts[0].pr_rank, Some(2));
+        assert_eq!(d.best_efforts[1].pr_rank, None);
+    }
+
+    #[test]
+    fn test_detail_deserializes_minimal_payload() {
+        // A watch with no HR strap, no laps, non-run activity: Strava omits
+        // most keys entirely. This must not fail the parse.
+        let d: StravaActivityDetail = serde_json::from_str("{}").unwrap();
+        assert!(d.average_heartrate.is_none());
+        assert!(d.splits_metric.is_empty());
+        assert!(d.laps.is_empty());
+        assert!(d.best_efforts.is_empty());
     }
 }
