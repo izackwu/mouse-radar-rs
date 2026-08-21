@@ -41,6 +41,7 @@ async fn main() -> anyhow::Result<()> {
             c.model.clone(),
             c.api_key.clone(),
             std::time::Duration::from_secs(c.timeout_seconds),
+            c.max_tokens,
         )?))
     } else {
         info!("AI comments disabled (AI_API_KEY not set)");

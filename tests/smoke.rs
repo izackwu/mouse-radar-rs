@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use std::sync::Arc;
 
-use mouse_radar_rs::ai::AiClient;
+use mouse_radar_rs::ai::{AiClient, AiResponse};
 use mouse_radar_rs::comment;
 use mouse_radar_rs::config::AiConfig;
 use mouse_radar_rs::db::{self, CachedActivity, Db};
@@ -189,11 +189,15 @@ struct StubAi {
 
 #[async_trait]
 impl AiClient for StubAi {
-    async fn comment(&self, _system: &str, _user: &str) -> anyhow::Result<String> {
+    async fn comment(&self, _system: &str, _user: &str) -> anyhow::Result<AiResponse> {
         if self.fail {
             anyhow::bail!("stub failure");
         }
-        Ok(self.response.clone())
+        Ok(AiResponse {
+            content: self.response.clone(),
+            finish_reason: Some("stop".into()),
+            ..AiResponse::default()
+        })
     }
 }
 
@@ -205,6 +209,7 @@ fn test_ai_config() -> AiConfig {
         history_limit: 30,
         timeout_seconds: 20,
         max_chars: 280,
+        max_tokens: 1000,
         system_prompt: None,
     }
 }
