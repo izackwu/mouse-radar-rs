@@ -6,3 +6,7 @@ services:
       - .env
     volumes:
       - ./data:/app/data
+      # Uncomment to use AI_SYSTEM_PROMPT_FILE — the path it names must live
+      # inside a mounted volume, and the file is re-read per request, so edits
+      # on the host take effect without recreating the container.
+      # - ./prompts:/app/prompts:ro

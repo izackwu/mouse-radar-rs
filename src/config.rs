@@ -30,7 +30,10 @@ pub struct AiConfig {
     /// a low value makes them return empty content with
     /// `finish_reason: "length"`.
     pub max_tokens: u32,
-    pub system_prompt: Option<String>,
+    /// Path to a file holding the system prompt. Read fresh on every request,
+    /// not cached here, so editing the file retunes the bot's voice without a
+    /// restart. `None` uses `comment::DEFAULT_SYSTEM_PROMPT`.
+    pub system_prompt_path: Option<String>,
 }
 
 impl std::fmt::Debug for AiConfig {
@@ -43,10 +46,10 @@ impl std::fmt::Debug for AiConfig {
             .field("timeout_seconds", &self.timeout_seconds)
             .field("max_chars", &self.max_chars)
             .field("max_tokens", &self.max_tokens)
-            .field(
-                "system_prompt",
-                &self.system_prompt.as_ref().map(|_| "<custom>"),
-            )
+            // A path, unlike the prompt text it used to hold, is short and
+            // carries nothing sensitive — print it, it's the useful half of
+            // diagnosing a prompt that didn't load.
+            .field("system_prompt_path", &self.system_prompt_path)
             .finish()
     }
 }
@@ -69,9 +72,10 @@ impl AiConfig {
             timeout_seconds: parse_env_default("AI_TIMEOUT_SECONDS", 20),
             max_chars: parse_env_default("AI_MAX_CHARS", 280),
             max_tokens: parse_env_default("AI_MAX_TOKENS", 1000),
-            system_prompt: env::var("AI_SYSTEM_PROMPT")
+            system_prompt_path: env::var("AI_SYSTEM_PROMPT_FILE")
                 .ok()
-                .filter(|s| !s.trim().is_empty()),
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty()),
         })
     }
 }
@@ -307,7 +311,7 @@ mod tests {
         env::remove_var("AI_HISTORY_LIMIT");
         env::remove_var("AI_TIMEOUT_SECONDS");
         env::remove_var("AI_MAX_CHARS");
-        env::remove_var("AI_SYSTEM_PROMPT");
+        env::remove_var("AI_SYSTEM_PROMPT_FILE");
 
         let ai = Config::from_env().unwrap().ai.unwrap();
         assert_eq!(ai.api_key, "sk-test");
@@ -316,8 +320,49 @@ mod tests {
         assert_eq!(ai.history_limit, 30);
         assert_eq!(ai.timeout_seconds, 20);
         assert_eq!(ai.max_chars, 280);
-        assert!(ai.system_prompt.is_none());
+        assert!(ai.system_prompt_path.is_none());
 
+        env::remove_var("AI_API_KEY");
+    }
+
+    #[test]
+    fn test_ai_system_prompt_file_is_read_as_a_path() {
+        let _guard = CONFIG_LOCK.lock().unwrap();
+        env::set_var("TELEGRAM_BOT_TOKEN", "t");
+        env::set_var("TELEGRAM_CHAT_ID", "c");
+        env::set_var("STRAVA_CLIENT_ID", "id");
+        env::set_var("STRAVA_CLIENT_SECRET", "secret");
+        env::set_var("AI_API_KEY", "sk-test");
+        // Surrounding whitespace is stripped: a trailing space in a .env file
+        // would otherwise produce a path that never resolves.
+        env::set_var("AI_SYSTEM_PROMPT_FILE", "  ./prompts/coach.txt  ");
+
+        let ai = Config::from_env().unwrap().ai.unwrap();
+        assert_eq!(
+            ai.system_prompt_path.as_deref(),
+            Some("./prompts/coach.txt")
+        );
+
+        env::remove_var("AI_SYSTEM_PROMPT_FILE");
+        env::remove_var("AI_API_KEY");
+    }
+
+    #[test]
+    fn test_ai_blank_system_prompt_file_is_none() {
+        let _guard = CONFIG_LOCK.lock().unwrap();
+        env::set_var("TELEGRAM_BOT_TOKEN", "t");
+        env::set_var("TELEGRAM_CHAT_ID", "c");
+        env::set_var("STRAVA_CLIENT_ID", "id");
+        env::set_var("STRAVA_CLIENT_SECRET", "secret");
+        env::set_var("AI_API_KEY", "sk-test");
+        // `.env.example` ships the key with an empty value; that must mean
+        // "use the built-in prompt", not "load the file named ''".
+        env::set_var("AI_SYSTEM_PROMPT_FILE", "   ");
+
+        let ai = Config::from_env().unwrap().ai.unwrap();
+        assert!(ai.system_prompt_path.is_none());
+
+        env::remove_var("AI_SYSTEM_PROMPT_FILE");
         env::remove_var("AI_API_KEY");
     }
 
@@ -331,12 +376,12 @@ mod tests {
             timeout_seconds: 20,
             max_chars: 280,
             max_tokens: 1000,
-            system_prompt: Some("custom persona".into()),
+            system_prompt_path: Some("./prompts/coach.txt".into()),
         };
         let rendered = format!("{:?}", ai);
         assert!(!rendered.contains("sk-supersecret"));
-        assert!(!rendered.contains("custom persona"));
         assert!(rendered.contains("<redacted>"));
         assert!(rendered.contains("gpt-4o-mini"));
+        assert!(rendered.contains("./prompts/coach.txt"));
     }
 }

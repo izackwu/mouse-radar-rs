@@ -12,7 +12,8 @@ use crate::formatting::{format_duration, format_pace};
 use crate::strava::{StravaActivityDetail, StravaApi};
 use crate::types::ActivityType;
 
-/// Persona and guardrails for the comment. Overridable via `AI_SYSTEM_PROMPT`.
+/// Persona and guardrails for the comment. Overridable by pointing
+/// `AI_SYSTEM_PROMPT_FILE` at a file.
 ///
 /// The qualitative-comparison rule is deliberate: the model is handed a raw
 /// history table and does its own arithmetic, so the prompt biases it toward
@@ -34,6 +35,49 @@ it must appear verbatim in the data.
 
 /// History length at or below which the model is told not to infer trends.
 const THIN_HISTORY_THRESHOLD: usize = 2;
+
+/// Load the system prompt for a single request.
+///
+/// Deliberately re-read per request rather than cached at startup: the prompt
+/// is the knob you turn most while tuning the bot's voice, and re-reading
+/// makes an edit take effect on the next activity instead of the next deploy.
+/// The file is a few kilobytes and one request already costs a network
+/// round-trip, so the read is free by comparison.
+///
+/// Every failure — missing, unreadable, blank — falls back to the built-in
+/// prompt and warns. A bad path should flatten the bot's personality, never
+/// cost it a comment.
+async fn resolve_system_prompt(cfg: &AiConfig) -> String {
+    let Some(path) = &cfg.system_prompt_path else {
+        return DEFAULT_SYSTEM_PROMPT.to_string();
+    };
+
+    match tokio::fs::read_to_string(path).await {
+        Ok(text) if !text.trim().is_empty() => {
+            let text = text.trim().to_string();
+            debug!(
+                "Loaded system prompt from {} ({} chars)",
+                path,
+                text.chars().count()
+            );
+            text
+        }
+        Ok(_) => {
+            warn!(
+                "System prompt file {} is empty; falling back to the built-in prompt",
+                path
+            );
+            DEFAULT_SYSTEM_PROMPT.to_string()
+        }
+        Err(e) => {
+            warn!(
+                "Cannot read system prompt file {} ({}); falling back to the built-in prompt",
+                path, e
+            );
+            DEFAULT_SYSTEM_PROMPT.to_string()
+        }
+    }
+}
 
 fn pr_phrase(rank: i64) -> String {
     match rank {
@@ -380,10 +424,7 @@ pub async fn compose_comment(
     };
 
     let user = build_user_message(athlete_name, activity, detail.as_ref(), &history);
-    let system = cfg
-        .system_prompt
-        .as_deref()
-        .unwrap_or(DEFAULT_SYSTEM_PROMPT);
+    let system = resolve_system_prompt(cfg).await;
 
     debug!(
         "Composing comment for {}: {} history rows, detail={}, prompt {} chars",
@@ -393,7 +434,7 @@ pub async fn compose_comment(
         user.chars().count()
     );
 
-    let response = ai.comment(system, &user).await?;
+    let response = ai.comment(&system, &user).await?;
     let comment = sanitize(&response.content, cfg.max_chars);
 
     if comment.is_none() {
@@ -535,6 +576,68 @@ mod tests {
             start_date: format!("2026-08-{}T06:28:00Z", day),
             url: "u".into(),
         }
+    }
+
+    fn cfg_with_prompt(path: Option<&str>) -> AiConfig {
+        AiConfig {
+            api_key: "k".into(),
+            base_url: "http://localhost".into(),
+            model: "m".into(),
+            history_limit: 30,
+            timeout_seconds: 20,
+            max_chars: 280,
+            max_tokens: 1000,
+            system_prompt_path: path.map(String::from),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_system_prompt_defaults_when_no_path_set() {
+        let prompt = resolve_system_prompt(&cfg_with_prompt(None)).await;
+        assert_eq!(prompt, DEFAULT_SYSTEM_PROMPT);
+    }
+
+    #[tokio::test]
+    async fn test_system_prompt_read_from_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coach.txt");
+        std::fs::write(&path, "  You are a laconic trail runner.\n\n").unwrap();
+
+        let prompt = resolve_system_prompt(&cfg_with_prompt(Some(path.to_str().unwrap()))).await;
+        // Trimmed: trailing newlines from an editor are not part of the prompt.
+        assert_eq!(prompt, "You are a laconic trail runner.");
+    }
+
+    #[tokio::test]
+    async fn test_system_prompt_is_reread_on_every_call() {
+        // The whole reason the prompt is a path and not a string: editing the
+        // file must retune the bot without a restart.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coach.txt");
+        let cfg = cfg_with_prompt(Some(path.to_str().unwrap()));
+
+        std::fs::write(&path, "first voice").unwrap();
+        assert_eq!(resolve_system_prompt(&cfg).await, "first voice");
+
+        std::fs::write(&path, "second voice").unwrap();
+        assert_eq!(resolve_system_prompt(&cfg).await, "second voice");
+    }
+
+    #[tokio::test]
+    async fn test_system_prompt_missing_file_falls_back_to_default() {
+        // A typo'd path must cost personality, not the comment itself.
+        let cfg = cfg_with_prompt(Some("/nonexistent/definitely/not/here.txt"));
+        assert_eq!(resolve_system_prompt(&cfg).await, DEFAULT_SYSTEM_PROMPT);
+    }
+
+    #[tokio::test]
+    async fn test_system_prompt_blank_file_falls_back_to_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.txt");
+        std::fs::write(&path, "   \n\t\n").unwrap();
+
+        let prompt = resolve_system_prompt(&cfg_with_prompt(Some(path.to_str().unwrap()))).await;
+        assert_eq!(prompt, DEFAULT_SYSTEM_PROMPT);
     }
 
     #[test]
