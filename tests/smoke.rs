@@ -210,7 +210,7 @@ fn test_ai_config() -> AiConfig {
         timeout_seconds: 20,
         max_chars: 280,
         max_tokens: 1000,
-        system_prompt: None,
+        system_prompt_path: None,
     }
 }
 
