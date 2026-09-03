@@ -334,7 +334,14 @@ pub fn bulk_cache_activities(conn: &Connection, activities: &[CachedActivity]) -
 /// Returns (monday, `first_of_month`) in the server's local timezone.
 #[must_use]
 pub fn period_boundaries() -> (NaiveDate, NaiveDate) {
-    let today = Local::now().date_naive();
+    period_boundaries_on(Local::now().date_naive())
+}
+
+/// Returns (monday, `first_of_month`) for the week and month containing
+/// `today`. Split out from `period_boundaries` so callers that need
+/// deterministic period arithmetic can supply the date.
+#[must_use]
+pub fn period_boundaries_on(today: NaiveDate) -> (NaiveDate, NaiveDate) {
     let monday = today - chrono::Duration::days(i64::from(today.weekday().num_days_from_monday()));
     let first_of_month =
         NaiveDate::from_ymd_opt(today.year(), today.month(), 1).expect("valid date");
@@ -356,6 +363,24 @@ pub fn get_week_km(conn: &Connection, athlete_id: i64, monday: NaiveDate) -> Res
     Ok(total)
 }
 
+/// Distance for each of `mondays`, paired with the Monday it covers.
+///
+/// Order follows the input, so the caller owns the presentation order. Each
+/// bucket goes through `get_week_km`, which keeps the week arithmetic
+/// identical to the figure on the activity card. A week with no activities is
+/// a genuine `0.0` — deciding whether that zero is *knowable* is the caller's
+/// job (see `collect_volume`).
+pub fn get_weekly_km(
+    conn: &Connection,
+    athlete_id: i64,
+    mondays: &[NaiveDate],
+) -> Result<Vec<(NaiveDate, f64)>> {
+    mondays
+        .iter()
+        .map(|m| Ok((*m, get_week_km(conn, athlete_id, *m)?)))
+        .collect()
+}
+
 pub fn get_month_km(conn: &Connection, athlete_id: i64, first_of_month: NaiveDate) -> Result<f64> {
     let month_str = first_of_month.format("%Y-%m-%d").to_string();
     let next_month = if first_of_month.month() == 12 {
@@ -374,6 +399,53 @@ pub fn get_month_km(conn: &Connection, athlete_id: i64, first_of_month: NaiveDat
         |row| row.get(0),
     )?;
     Ok(total)
+}
+
+/// How many completed weeks before the current one the AI comment prompt's
+/// volume table reaches back.
+const VOLUME_PRIOR_WEEKS: i64 = 4;
+
+/// Gather the training-volume figures the AI comment prompt reports, as of
+/// `today`.
+///
+/// `today` is a parameter rather than an internal `Local::now()` so the
+/// period arithmetic is testable; production passes the server's local date,
+/// matching `period_boundaries`.
+pub fn collect_volume(
+    conn: &Connection,
+    athlete_id: i64,
+    today: NaiveDate,
+) -> Result<crate::comment::VolumeStats> {
+    let (week_start, month_start) = period_boundaries_on(today);
+    let last_month_start = if month_start.month() == 1 {
+        NaiveDate::from_ymd_opt(month_start.year() - 1, 12, 1)
+    } else {
+        NaiveDate::from_ymd_opt(month_start.year(), month_start.month() - 1, 1)
+    }
+    .expect("valid date");
+
+    let oldest_cached = get_oldest_activity_date(conn, athlete_id)?;
+
+    // A week that ends before the cache begins is unknowable, not empty.
+    // Reporting it as 0.0 km would hand the model a down-week the athlete
+    // never had — precisely the invented trend the prompt forbids.
+    let mondays: Vec<NaiveDate> = (1..=VOLUME_PRIOR_WEEKS)
+        .map(|n| week_start - chrono::Duration::weeks(n))
+        .filter(|monday| {
+            oldest_cached.is_some_and(|oldest| oldest < *monday + chrono::Duration::weeks(1))
+        })
+        .collect();
+
+    Ok(crate::comment::VolumeStats {
+        week_start,
+        week_km: get_week_km(conn, athlete_id, week_start)?,
+        month_start,
+        month_km: get_month_km(conn, athlete_id, month_start)?,
+        last_month_start,
+        last_month_km: get_month_km(conn, athlete_id, last_month_start)?,
+        prior_weeks: get_weekly_km(conn, athlete_id, &mondays)?,
+        oldest_cached,
+    })
 }
 
 pub fn get_oldest_activity_date(conn: &Connection, athlete_id: i64) -> Result<Option<NaiveDate>> {
@@ -776,6 +848,174 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn test_weekly_km_buckets_preserve_input_order_and_zero_fill() {
+        let db = test_db();
+        db.run(|conn| {
+            upsert_athlete(conn, 1, "alice", "a", "r", 0)?;
+            // 2026-05-11 is a Monday. One activity in the week of 05-04, two
+            // in the week of 05-11, none in the week of 05-18.
+            for (id, date, km) in [
+                (1, "2026-05-06T08:00:00Z", 5.0),
+                (2, "2026-05-14T08:00:00Z", 8.0),
+                (3, "2026-05-15T16:00:00Z", 4.5),
+            ] {
+                cache_activity(
+                    conn,
+                    &CachedActivity {
+                        activity_id: id,
+                        athlete_id: 1,
+                        title: format!("Run {}", id),
+                        activity_type: ActivityType::Run,
+                        distance_km: km,
+                        duration_s: 1800,
+                        pace_sec_per_km: None,
+                        start_date_local: date.into(),
+                        start_date: date.into(),
+                        url: "u".into(),
+                    },
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        let may_04 = NaiveDate::from_ymd_opt(2026, 5, 4).unwrap();
+        let may_11 = NaiveDate::from_ymd_opt(2026, 5, 11).unwrap();
+        let may_18 = NaiveDate::from_ymd_opt(2026, 5, 18).unwrap();
+
+        // Newest-first input comes back newest-first: the caller decides the
+        // order, and an empty week is a real 0.0, not a missing row.
+        let got = db
+            .run(|conn| get_weekly_km(conn, 1, &[may_18, may_11, may_04]))
+            .unwrap();
+        assert_eq!(got, vec![(may_18, 0.0), (may_11, 12.5), (may_04, 5.0)]);
+    }
+
+    /// Cache a run of `km` on `date` for athlete 1.
+    fn cache_run(conn: &Connection, id: i64, date: &str, km: f64) -> Result<()> {
+        cache_activity(
+            conn,
+            &CachedActivity {
+                activity_id: id,
+                athlete_id: 1,
+                title: format!("Run {}", id),
+                activity_type: ActivityType::Run,
+                distance_km: km,
+                duration_s: 1800,
+                pace_sec_per_km: None,
+                start_date_local: format!("{}T08:00:00Z", date),
+                start_date: format!("{}T08:00:00Z", date),
+                url: "u".into(),
+            },
+        )
+    }
+
+    #[test]
+    fn test_collect_volume_assembles_periods_from_a_fixed_today() {
+        let db = test_db();
+        db.run(|conn| {
+            upsert_athlete(conn, 1, "alice", "a", "r", 0)?;
+            // 2026-08-31 is a Monday; "today" is Thu 2026-09-03.
+            cache_run(conn, 1, "2026-09-02", 10.0)?; // this week, September
+            cache_run(conn, 2, "2026-08-31", 6.0)?; // this week, but August
+            cache_run(conn, 3, "2026-08-26", 20.0)?; // week of 08-24
+            cache_run(conn, 4, "2026-08-19", 15.0)?; // week of 08-17
+            cache_run(conn, 5, "2026-08-05", 9.0)?; // week of 08-03
+            Ok(())
+        })
+        .unwrap();
+
+        let today = NaiveDate::from_ymd_opt(2026, 9, 3).unwrap();
+        let v = db.run(|conn| collect_volume(conn, 1, today)).unwrap();
+
+        assert_eq!(v.week_start, NaiveDate::from_ymd_opt(2026, 8, 31).unwrap());
+        assert_eq!(v.week_km, 16.0);
+        assert_eq!(v.month_start, NaiveDate::from_ymd_opt(2026, 9, 1).unwrap());
+        assert_eq!(v.month_km, 10.0);
+        assert_eq!(
+            v.last_month_start,
+            NaiveDate::from_ymd_opt(2026, 8, 1).unwrap()
+        );
+        assert_eq!(v.last_month_km, 50.0);
+        assert_eq!(v.oldest_cached, NaiveDate::from_ymd_opt(2026, 8, 5));
+
+        // The four weeks before the current one, newest first. The week of
+        // 08-10 is empty but knowable, so it stays as a real zero.
+        let weeks: Vec<(String, f64)> = v
+            .prior_weeks
+            .iter()
+            .map(|(m, km)| (m.to_string(), *km))
+            .collect();
+        assert_eq!(
+            weeks,
+            vec![
+                ("2026-08-24".to_string(), 20.0),
+                ("2026-08-17".to_string(), 15.0),
+                ("2026-08-10".to_string(), 0.0),
+                ("2026-08-03".to_string(), 9.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_collect_volume_omits_weeks_entirely_before_the_cache() {
+        // A fabricated 0.0 km week reads as a down-week the athlete never had.
+        // Weeks that end before the cache begins are unknowable, not empty,
+        // and must not reach the prompt at all.
+        let db = test_db();
+        db.run(|conn| {
+            upsert_athlete(conn, 1, "alice", "a", "r", 0)?;
+            cache_run(conn, 1, "2026-08-19", 15.0)
+        })
+        .unwrap();
+
+        let today = NaiveDate::from_ymd_opt(2026, 9, 3).unwrap();
+        let v = db.run(|conn| collect_volume(conn, 1, today)).unwrap();
+
+        // Cache starts 2026-08-19, inside the week of 08-17. That week is
+        // knowable-but-partial and stays; 08-10 and 08-03 end before any data
+        // exists and are dropped. 08-24 is after the cache starts: a true zero.
+        let mondays: Vec<String> = v.prior_weeks.iter().map(|(m, _)| m.to_string()).collect();
+        assert_eq!(mondays, vec!["2026-08-24", "2026-08-17"]);
+    }
+
+    #[test]
+    fn test_collect_volume_with_no_cache_has_no_prior_weeks() {
+        let db = test_db();
+        db.run(|conn| upsert_athlete(conn, 1, "alice", "a", "r", 0))
+            .unwrap();
+
+        let today = NaiveDate::from_ymd_opt(2026, 9, 3).unwrap();
+        let v = db.run(|conn| collect_volume(conn, 1, today)).unwrap();
+
+        assert_eq!(v.oldest_cached, None);
+        assert!(v.prior_weeks.is_empty());
+        assert_eq!(v.week_km, 0.0);
+        assert_eq!(v.last_month_km, 0.0);
+    }
+
+    #[test]
+    fn test_collect_volume_january_rolls_back_to_december() {
+        let db = test_db();
+        db.run(|conn| {
+            upsert_athlete(conn, 1, "alice", "a", "r", 0)?;
+            cache_run(conn, 1, "2025-12-15", 30.0)?;
+            cache_run(conn, 2, "2026-01-05", 7.0)
+        })
+        .unwrap();
+
+        let today = NaiveDate::from_ymd_opt(2026, 1, 8).unwrap();
+        let v = db.run(|conn| collect_volume(conn, 1, today)).unwrap();
+
+        assert_eq!(
+            v.last_month_start,
+            NaiveDate::from_ymd_opt(2025, 12, 1).unwrap()
+        );
+        assert_eq!(v.last_month_km, 30.0);
+        assert_eq!(v.month_km, 7.0);
     }
 
     #[test]
