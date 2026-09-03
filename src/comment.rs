@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use chrono::{Local, NaiveDate};
 use log::{debug, info, warn};
 use teloxide::prelude::*;
 use teloxide::types::{MessageId, ReplyParameters};
@@ -17,7 +18,9 @@ use crate::types::ActivityType;
 ///
 /// The qualitative-comparison rule is deliberate: the model is handed a raw
 /// history table and does its own arithmetic, so the prompt biases it toward
-/// claims that stay true under approximation.
+/// claims that stay true under approximation. The VOLUME block is the
+/// exception — those totals are computed in `format_volume_block`, so the
+/// model is told it may quote them directly.
 pub const DEFAULT_SYSTEM_PROMPT: &str = "\
 You are a running coach commenting in a group chat where friends' Strava \
 activities are posted. Write ONE observation about the activity just posted, \
@@ -29,12 +32,51 @@ what they've been doing lately.
 - Prefer qualitative comparisons (\"noticeably quicker than your recent easy \
 runs\") over precise figures you'd have to calculate. If you do cite a number, \
 it must appear verbatim in the data.
+- The VOLUME totals are already calculated for you, so you may quote them \
+directly. A figure marked \"(partial)\" is a floor, not a total — never call \
+it a complete week or month, and never read a trend into it.
 - Observe what happened. Do not prescribe future workouts.
 - If the history is thin, keep it general — never invent a trend.
 - Plain text only: no markdown, no emoji, no greeting or sign-off.";
 
 /// History length at or below which the model is told not to infer trends.
 const THIN_HISTORY_THRESHOLD: usize = 2;
+
+/// Training volume over calendar periods, on the same Monday-start /
+/// first-of-month boundaries the activity card uses — so the "this week"
+/// figure in the prompt matches the WEEK figure on the card the comment
+/// replies to.
+///
+/// Built by `db::collect_volume`. Distances sum every cached activity type,
+/// not just runs, exactly as the card's totals do.
+#[derive(Debug, Clone)]
+pub struct VolumeStats {
+    pub week_start: NaiveDate,
+    pub week_km: f64,
+    pub month_start: NaiveDate,
+    pub month_km: f64,
+    pub last_month_start: NaiveDate,
+    pub last_month_km: f64,
+    /// Completed weeks before the current one, newest first. Weeks that end
+    /// before the cache begins are absent rather than zero — see
+    /// `db::collect_volume`.
+    pub prior_weeks: Vec<(NaiveDate, f64)>,
+    /// Date of the athlete's oldest cached activity, or `None` when nothing is
+    /// cached. Any period starting before this is a floor, not a total.
+    pub oldest_cached: Option<NaiveDate>,
+}
+
+impl VolumeStats {
+    /// Whether a period beginning on `start` reaches back further than the
+    /// cache does, making its total a lower bound.
+    ///
+    /// Same rule as `formatting::incomplete_periods`, which drives the card's
+    /// asterisk.
+    #[must_use]
+    fn is_partial(&self, start: NaiveDate) -> bool {
+        self.oldest_cached.is_none_or(|oldest| oldest > start)
+    }
+}
 
 /// Load the system prompt for a single request.
 ///
@@ -147,6 +189,93 @@ fn format_local_display(start_date_local: &str) -> String {
     }
 }
 
+/// Render the VOLUME block: calendar-period totals plus the recent weekly
+/// breakdown.
+///
+/// These totals are precomputed on purpose. The system prompt tells the model
+/// not to do its own arithmetic over the history table, which would otherwise
+/// leave it no honest way to say anything about training volume.
+fn format_volume_block(v: &VolumeStats) -> String {
+    // The poller caches an activity before notifying, so the activity being
+    // commented on is already inside these totals. Saying so is not optional:
+    // otherwise the model reads the week figure as the state *before* this
+    // run and adds the two. It lives here rather than in the system prompt
+    // because `AI_SYSTEM_PROMPT_FILE` can replace that wholesale, and the
+    // caveat has to travel with the numbers it describes.
+    let mut s = String::from("\nVOLUME (including this activity)\n");
+
+    let mark = |partial: bool| if partial { "  (partial)" } else { "" };
+
+    let rows = [
+        (
+            format!("This week (Mon {} to date)", v.week_start),
+            v.week_km,
+            v.is_partial(v.week_start),
+        ),
+        (
+            format!("This month ({} to date)", v.month_start.format("%b %Y")),
+            v.month_km,
+            v.is_partial(v.month_start),
+        ),
+        (
+            format!("Last month ({})", v.last_month_start.format("%b %Y")),
+            v.last_month_km,
+            v.is_partial(v.last_month_start),
+        ),
+    ];
+
+    // Bind the label to a String and pad it here rather than inline: the
+    // three labels differ in length and the model reads this as a table.
+    let width = rows
+        .iter()
+        .map(|(l, ..)| l.chars().count())
+        .max()
+        .unwrap_or(0);
+    for (label, km, partial) in &rows {
+        s.push_str(&format!(
+            "  {:<width$}  {:>7.1} km{}\n",
+            label,
+            km,
+            mark(*partial),
+            width = width
+        ));
+    }
+
+    // Count what is actually listed: `collect_volume` drops weeks that end
+    // before the cache begins, so this is not always four.
+    if !v.prior_weeks.is_empty() {
+        let n = v.prior_weeks.len();
+        s.push_str(&format!(
+            "\n  {} week{} before this one:\n",
+            n,
+            if n == 1 { "" } else { "s" }
+        ));
+        for (monday, km) in &v.prior_weeks {
+            s.push_str(&format!(
+                "    week of {}  {:>7.1} km{}\n",
+                monday,
+                km,
+                mark(v.is_partial(*monday))
+            ));
+        }
+    }
+
+    let any_partial = rows.iter().any(|(.., partial)| *partial)
+        || v.prior_weeks.iter().any(|(m, _)| v.is_partial(*m));
+    if any_partial {
+        match v.oldest_cached {
+            Some(oldest) => s.push_str(&format!(
+                "\n  (partial) = this athlete's recorded history only starts {}, \
+                 so the figure is a floor, not a total.\n",
+                oldest
+            )),
+            None => s.push_str("\n  (partial) = no recorded history for this athlete yet.\n"),
+        }
+    }
+
+    s
+}
+
 /// Build the user half of the prompt: the activity, its detail, and the
 /// athlete's recent history.
 #[must_use]
@@ -155,6 +284,7 @@ pub fn build_user_message(
     activity: &CachedActivity,
     detail: Option<&StravaActivityDetail>,
     history: &[CachedActivity],
+    volume: &VolumeStats,
 ) -> String {
     let mut s = String::new();
 
@@ -253,6 +383,8 @@ pub fn build_user_message(
             }
         }
     }
+
+    s.push_str(&format_volume_block(volume));
 
     s.push_str(&format!(
         "\nRECENT HISTORY (newest first — {} activities)\n",
@@ -376,7 +508,14 @@ pub async fn compose_comment(
     // activities race this task on the blocking pool with no ordering
     // barrier, so `exclude_id` alone is not enough to keep a not-yet-notified
     // activity out of this history (see `get_recent_activities`).
-    let history = {
+    //
+    // The volume totals ride along in the same blocking hop. They are
+    // deliberately NOT bounded by `before_local`: the card in the notification
+    // this comment replies to includes the activity being commented on, and a
+    // volume figure that disagreed with the card would be the more visible
+    // wrong. The residual risk is a back-to-back activity cached mid-compose
+    // nudging the total up.
+    let (history, volume) = {
         let db = Arc::clone(db);
         let athlete_id = activity.athlete_id;
         let exclude = activity.activity_id;
@@ -384,13 +523,15 @@ pub async fn compose_comment(
         let limit = cfg.history_limit;
         tokio::task::spawn_blocking(move || {
             db.run(|conn| {
-                db::get_recent_activities(
+                let history = db::get_recent_activities(
                     conn,
                     athlete_id,
                     Some(exclude),
                     Some(&before_local),
                     limit,
-                )
+                )?;
+                let volume = db::collect_volume(conn, athlete_id, Local::now().date_naive())?;
+                Ok((history, volume))
             })
         })
         .await??
@@ -423,7 +564,7 @@ pub async fn compose_comment(
         }
     };
 
-    let user = build_user_message(athlete_name, activity, detail.as_ref(), &history);
+    let user = build_user_message(athlete_name, activity, detail.as_ref(), &history, &volume);
     let system = resolve_system_prompt(cfg).await;
 
     debug!(
@@ -578,6 +719,119 @@ mod tests {
         }
     }
 
+    fn date(y: i32, m: u32, d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    }
+
+    /// Volume as of Thu 2026-09-03, with a cache deep enough that nothing is
+    /// partial.
+    fn vol() -> VolumeStats {
+        VolumeStats {
+            week_start: date(2026, 8, 31),
+            week_km: 28.4,
+            month_start: date(2026, 9, 1),
+            month_km: 41.2,
+            last_month_start: date(2026, 8, 1),
+            last_month_km: 168.9,
+            prior_weeks: vec![
+                (date(2026, 8, 24), 51.0),
+                (date(2026, 8, 17), 38.2),
+                (date(2026, 8, 10), 44.6),
+                (date(2026, 8, 3), 29.1),
+            ],
+            oldest_cached: Some(date(2026, 5, 1)),
+        }
+    }
+
+    /// The first line of `text` containing `needle`.
+    fn line_with<'a>(text: &'a str, needle: &str) -> &'a str {
+        text.lines()
+            .find(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("no line containing {:?} in:\n{}", needle, text))
+    }
+
+    #[test]
+    fn test_volume_block_renders_each_period_and_prior_weeks() {
+        let block = format_volume_block(&vol());
+
+        assert!(block.contains("VOLUME"), "block was:\n{}", block);
+        assert!(line_with(&block, "This week").contains("Mon 2026-08-31 to date"));
+        assert!(line_with(&block, "This week").contains("28.4 km"));
+        // The year is spelled out: in January "last month" is the year before.
+        assert!(line_with(&block, "This month").contains("Sep 2026 to date"));
+        assert!(line_with(&block, "This month").contains("41.2 km"));
+        assert!(line_with(&block, "Last month").contains("Aug 2026"));
+        assert!(line_with(&block, "Last month").contains("168.9 km"));
+
+        assert!(line_with(&block, "2026-08-17").contains("38.2 km"));
+        assert!(line_with(&block, "2026-08-03").contains("29.1 km"));
+        assert!(!block.contains("partial"), "block was:\n{}", block);
+    }
+
+    #[test]
+    fn test_volume_block_heading_says_it_includes_this_activity() {
+        // The poller caches before notifying, so the activity being commented
+        // on is inside these totals. Left unsaid, the model reads "28.4 km
+        // this week" as the week *before* this run and adds the two.
+        //
+        // This belongs in the user message, not the system prompt:
+        // AI_SYSTEM_PROMPT_FILE can replace the system prompt wholesale, and
+        // the caveat has to travel with the numbers it describes.
+        let block = format_volume_block(&vol());
+
+        // On the VOLUME heading itself, ahead of any figure.
+        let heading = line_with(&block, "VOLUME");
+        assert_eq!(heading, "VOLUME (including this activity)");
+    }
+
+    #[test]
+    fn test_volume_block_marks_only_the_periods_the_cache_cannot_cover() {
+        // Cache starts mid-August: last month's total is a floor, but this
+        // week and this month are fully covered and must not be hedged.
+        let v = VolumeStats {
+            oldest_cached: Some(date(2026, 8, 5)),
+            ..vol()
+        };
+        let block = format_volume_block(&v);
+
+        assert!(line_with(&block, "Last month").contains("partial"));
+        assert!(!line_with(&block, "This week").contains("partial"));
+        assert!(!line_with(&block, "This month").contains("partial"));
+        // The note names the date the history starts, so the model can see
+        // exactly how far the floor is from the truth.
+        assert!(block.contains("2026-08-05"), "block was:\n{}", block);
+    }
+
+    #[test]
+    fn test_volume_block_counts_the_weeks_it_actually_shows() {
+        // `collect_volume` drops weeks that end before the cache begins, so
+        // the heading must not promise four weeks when it lists two.
+        let v = VolumeStats {
+            prior_weeks: vec![(date(2026, 8, 24), 51.0), (date(2026, 8, 17), 38.2)],
+            oldest_cached: Some(date(2026, 8, 19)),
+            ..vol()
+        };
+        let block = format_volume_block(&v);
+
+        assert!(block.contains("2 weeks before"), "block was:\n{}", block);
+        assert!(!block.contains("4 weeks before"), "block was:\n{}", block);
+    }
+
+    #[test]
+    fn test_volume_block_omits_the_week_table_when_nothing_is_knowable() {
+        let v = VolumeStats {
+            prior_weeks: vec![],
+            oldest_cached: Some(date(2026, 8, 31)),
+            ..vol()
+        };
+        let block = format_volume_block(&v);
+
+        assert!(!block.contains("weeks before"), "block was:\n{}", block);
+        assert!(!block.contains("week of"), "block was:\n{}", block);
+        // The periods themselves still render.
+        assert!(block.contains("This week"), "block was:\n{}", block);
+    }
+
     fn cfg_with_prompt(path: Option<&str>) -> AiConfig {
         AiConfig {
             api_key: "k".into(),
@@ -647,7 +901,7 @@ mod tests {
             act(98, "14", 8.0, Some(327)),
             act(97, "12", 10.2, Some(331)),
         ];
-        let msg = build_user_message("Zack", &current, None, &history);
+        let msg = build_user_message("Zack", &current, None, &history, &vol());
 
         assert!(msg.contains("ATHLETE: Zack"));
         assert!(msg.contains("12.4 km"));
@@ -658,18 +912,37 @@ mod tests {
     }
 
     #[test]
+    fn test_user_message_places_volume_between_the_activity_and_the_history() {
+        let msg = build_user_message(
+            "Zack",
+            &act(99, "16", 12.4, Some(312)),
+            None,
+            &[act(98, "14", 8.0, None)],
+            &vol(),
+        );
+
+        let volume = msg.find("VOLUME").expect("VOLUME block missing");
+        let history = msg.find("RECENT HISTORY").expect("history missing");
+        let activity = msg.find("THIS ACTIVITY").expect("activity missing");
+        assert!(
+            activity < volume && volume < history,
+            "block order wrong in:\n{}",
+            msg
+        );
+        assert!(msg.contains("168.9 km"), "msg was:\n{}", msg);
+    }
+
+    #[test]
     fn test_thin_history_hint_fires_at_two_or_fewer() {
         let current = act(99, "16", 12.4, Some(312));
         let thin = vec![act(98, "14", 8.0, Some(327))];
-        assert!(
-            build_user_message("Zack", &current, None, &thin).contains("do not describe trends")
-        );
+        assert!(build_user_message("Zack", &current, None, &thin, &vol())
+            .contains("do not describe trends"));
 
         let thick: Vec<CachedActivity> =
             (1..=5).map(|i| act(90 + i, "10", 8.0, Some(320))).collect();
-        assert!(
-            !build_user_message("Zack", &current, None, &thick).contains("do not describe trends")
-        );
+        assert!(!build_user_message("Zack", &current, None, &thick, &vol())
+            .contains("do not describe trends"));
     }
 
     #[test]
@@ -680,13 +953,13 @@ mod tests {
         let current = act(99, "16", 12.4, Some(312));
 
         let two: Vec<CachedActivity> = (1..=2).map(|i| act(90 + i, "10", 8.0, Some(320))).collect();
-        assert!(build_user_message("Zack", &current, None, &two).contains("do not describe trends"));
+        assert!(build_user_message("Zack", &current, None, &two, &vol())
+            .contains("do not describe trends"));
 
         let three: Vec<CachedActivity> =
             (1..=3).map(|i| act(90 + i, "10", 8.0, Some(320))).collect();
-        assert!(
-            !build_user_message("Zack", &current, None, &three).contains("do not describe trends")
-        );
+        assert!(!build_user_message("Zack", &current, None, &three, &vol())
+            .contains("do not describe trends"));
     }
 
     #[test]
@@ -696,7 +969,7 @@ mod tests {
         // early-returns before calling it with one. The note must not claim
         // "2 prior activities" when there are zero.
         let current = act(99, "16", 12.4, Some(312));
-        let msg = build_user_message("Zack", &current, None, &[]);
+        let msg = build_user_message("Zack", &current, None, &[], &vol());
 
         assert!(msg.contains("RECENT HISTORY (newest first — 0 activities)"));
         assert!(msg.contains("0 prior activities are on record"));
@@ -709,7 +982,7 @@ mod tests {
         // as UTC. This is the one place that raw string reaches the model;
         // it must be reformatted as "YYYY-MM-DD HH:MM local" instead.
         let current = act(99, "16", 12.4, Some(312));
-        let msg = build_user_message("Zack", &current, None, &[]);
+        let msg = build_user_message("Zack", &current, None, &[], &vol());
 
         assert!(msg.contains("2026-08-16 06:28 local"));
         assert!(!msg.contains("2026-08-16T06:28:00Z"));
@@ -732,6 +1005,7 @@ mod tests {
             &act(99, "16", 12.4, Some(312)),
             None,
             &[act(98, "14", 8.0, None)],
+            &vol(),
         );
         assert!(!msg.contains("SPLITS"));
         assert!(!msg.contains("LAPS"));
@@ -754,6 +1028,7 @@ mod tests {
             &act(99, "16", 12.4, Some(312)),
             Some(&detail),
             &[act(98, "14", 8.0, None)],
+            &vol(),
         );
         assert!(msg.contains("elevation 240 m"));
         assert!(!msg.contains("avg HR"));
@@ -772,6 +1047,7 @@ mod tests {
             &act(99, "16", 12.4, Some(312)),
             Some(&detail),
             &[act(98, "14", 8.0, None)],
+            &vol(),
         );
         assert!(msg.contains("cadence 179 spm"), "msg was: {}", msg);
     }
@@ -785,7 +1061,13 @@ mod tests {
             average_cadence: Some(88.0),
             ..StravaActivityDetail::default()
         };
-        let msg = build_user_message("Zack", &ride, Some(&detail), &[act(98, "14", 8.0, None)]);
+        let msg = build_user_message(
+            "Zack",
+            &ride,
+            Some(&detail),
+            &[act(98, "14", 8.0, None)],
+            &vol(),
+        );
         assert!(msg.contains("cadence 88 rpm"), "msg was: {}", msg);
     }
 
@@ -793,7 +1075,13 @@ mod tests {
     fn test_history_has_column_headers_and_titles() {
         let mut prior = act(98, "14", 8.0, Some(327));
         prior.title = "Easy shakeout".into();
-        let msg = build_user_message("Zack", &act(99, "16", 12.4, Some(312)), None, &[prior]);
+        let msg = build_user_message(
+            "Zack",
+            &act(99, "16", 12.4, Some(312)),
+            None,
+            &[prior],
+            &vol(),
+        );
 
         assert!(msg.contains("date"), "msg was: {}", msg);
         assert!(msg.contains("distance"), "msg was: {}", msg);
@@ -805,7 +1093,13 @@ mod tests {
     fn test_history_title_newlines_do_not_break_the_table() {
         let mut prior = act(98, "14", 8.0, Some(327));
         prior.title = "Morning\nrun\twith friends".into();
-        let msg = build_user_message("Zack", &act(99, "16", 12.4, Some(312)), None, &[prior]);
+        let msg = build_user_message(
+            "Zack",
+            &act(99, "16", 12.4, Some(312)),
+            None,
+            &[prior],
+            &vol(),
+        );
 
         assert!(msg.contains("Morning run with friends"), "msg was: {}", msg);
         // One line per history row, plus the header — the title must not
@@ -860,6 +1154,7 @@ mod tests {
             &act(99, "16", 12.4, Some(312)),
             Some(&detail),
             &[act(98, "14", 8.0, None)],
+            &vol(),
         );
 
         assert!(msg.contains("SPLITS"));
