@@ -309,6 +309,12 @@ pub fn build_user_message(
             format_duration(activity.duration_s)
         )),
     }
+    // "near" is deliberate: the label is the nearest populated place, not a
+    // precise address. Omitted entirely when unknown so the model has nothing
+    // to over-claim from.
+    if let Some(loc) = &activity.location {
+        s.push_str(&format!("  near {}\n", loc));
+    }
 
     if let Some(d) = detail {
         // Summary extras: only fields the device actually reported.
@@ -390,7 +396,9 @@ pub fn build_user_message(
         "\nRECENT HISTORY (newest first — {} activities)\n",
         history.len()
     ));
-    s.push_str("  date        type       distance      pace   duration  title\n");
+    s.push_str(
+        "  date        type       distance      pace   duration  location            title\n",
+    );
     for h in history {
         let date = h.start_date_local.get(..10).unwrap_or(&h.start_date_local);
         let pace = h
@@ -400,13 +408,17 @@ pub fn build_user_message(
         // by Display impls that route through `f.pad`, which strum's derive
         // does not guarantee. `String`'s impl does.
         let kind = h.activity_type.to_string();
+        // Location goes before the title: the title is variable-width and has
+        // to stay the last column or the table stops lining up.
+        let location = h.location.clone().unwrap_or_else(|| "—".to_string());
         s.push_str(&format!(
-            "  {}  {:<10} {:>6.1} km  {:>7}  {:>8}  {}\n",
+            "  {}  {:<10} {:>6.1} km  {:>7}  {:>8}  {:<18}  {}\n",
             date,
             kind,
             h.distance_km,
             pace,
             format_duration(h.duration_s),
+            location,
             flatten_title(&h.title),
         ));
     }
@@ -564,6 +576,27 @@ pub async fn compose_comment(
         }
     };
 
+    // Activities cached before the `location` column existed carry none, and
+    // the poller is the only thing that ever fills it — so `/test-ai-comment`
+    // on an old activity would otherwise show no location at all. The detail
+    // response already carries `start_latlng` and that request is already
+    // paid for, so resolve the gap here.
+    //
+    // Deliberately not written back to `activity_cache`: this task is
+    // detached and best-effort, and keeping it read-only against the cache
+    // avoids racing the poller's own writes for the same row.
+    let activity = &match (
+        &activity.location,
+        detail.as_ref().and_then(|d| d.start_latlng),
+    ) {
+        (None, Some((lat, lon))) => {
+            let mut filled = activity.clone();
+            filled.location = crate::geo::lookup(lat, lon);
+            std::borrow::Cow::Owned(filled)
+        }
+        _ => std::borrow::Cow::Borrowed(activity),
+    };
+
     let user = build_user_message(athlete_name, activity, detail.as_ref(), &history, &volume);
     let system = resolve_system_prompt(cfg).await;
 
@@ -716,6 +749,7 @@ mod tests {
             start_date_local: format!("2026-08-{}T06:28:00Z", day),
             start_date: format!("2026-08-{}T06:28:00Z", day),
             url: "u".into(),
+            location: None,
         }
     }
 
@@ -1022,6 +1056,7 @@ mod tests {
             splits_metric: vec![],
             laps: vec![],
             best_efforts: vec![],
+            start_latlng: None,
         };
         let msg = build_user_message(
             "Zack",
@@ -1090,6 +1125,86 @@ mod tests {
     }
 
     #[test]
+    fn test_activity_location_renders_as_a_near_line() {
+        let mut current = act(99, "16", 12.4, Some(312));
+        current.location = Some("Singapore, SG".into());
+        let msg = build_user_message("Zack", &current, None, &[], &vol());
+
+        assert!(
+            line_with(&msg, "near ").contains("near Singapore, SG"),
+            "msg was: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_activity_without_location_omits_the_near_line() {
+        // Indoor or manual activity, so no GPS: say nothing rather than guess.
+        let msg = build_user_message("Zack", &act(99, "16", 12.4, Some(312)), None, &[], &vol());
+
+        assert!(!msg.contains("near "), "msg was: {}", msg);
+    }
+
+    #[test]
+    fn test_history_row_shows_its_location() {
+        let mut prior = act(98, "14", 8.0, Some(327));
+        prior.location = Some("Kuala Lumpur, MY".into());
+        let msg = build_user_message(
+            "Zack",
+            &act(99, "16", 12.4, Some(312)),
+            None,
+            &[prior],
+            &vol(),
+        );
+
+        assert!(
+            line_with(&msg, "2026-08-14").contains("Kuala Lumpur, MY"),
+            "msg was: {}",
+            msg
+        );
+        assert!(msg.contains("location"), "msg was: {}", msg);
+    }
+
+    #[test]
+    fn test_history_row_without_location_renders_a_dash() {
+        // Activities cached before the column existed have no location; the
+        // column must still line up.
+        let msg = build_user_message(
+            "Zack",
+            &act(99, "16", 12.4, Some(312)),
+            None,
+            &[act(98, "14", 8.0, Some(327))],
+            &vol(),
+        );
+
+        assert!(
+            line_with(&msg, "2026-08-14").contains('—'),
+            "msg was: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_history_location_does_not_displace_the_title() {
+        // Title is variable-width and must stay the last column.
+        let mut prior = act(98, "14", 8.0, Some(327));
+        prior.title = "Easy shakeout".into();
+        prior.location = Some("Singapore, SG".into());
+        let msg = build_user_message(
+            "Zack",
+            &act(99, "16", 12.4, Some(312)),
+            None,
+            &[prior],
+            &vol(),
+        );
+
+        let row = line_with(&msg, "2026-08-14");
+        let loc_at = row.find("Singapore, SG").expect("location in row");
+        let title_at = row.find("Easy shakeout").expect("title in row");
+        assert!(loc_at < title_at, "row was: {}", row);
+    }
+
+    #[test]
     fn test_history_title_newlines_do_not_break_the_table() {
         let mut prior = act(98, "14", 8.0, Some(327));
         prior.title = "Morning\nrun\twith friends".into();
@@ -1148,6 +1263,7 @@ mod tests {
                     pr_rank: None,
                 },
             ],
+            start_latlng: None,
         };
         let msg = build_user_message(
             "Zack",

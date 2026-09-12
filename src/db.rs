@@ -118,6 +118,7 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             start_date_local TEXT,     -- ISO 8601 datetime in athlete's local timezone
             start_date       TEXT,     -- ISO 8601 datetime in true UTC (Strava's start_date)
             url             TEXT,
+            location        TEXT,      -- nearest populated place, e.g. Singapore, SG
             cached_at       INTEGER NOT NULL DEFAULT (unixepoch())
         );",
     )?;
@@ -128,6 +129,9 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
 pub fn migrate_schema(conn: &Connection) -> Result<()> {
     if !column_exists(conn, "activity_cache", "start_date")? {
         conn.execute_batch("ALTER TABLE activity_cache ADD COLUMN start_date TEXT;")?;
+    }
+    if !column_exists(conn, "activity_cache", "location")? {
+        conn.execute_batch("ALTER TABLE activity_cache ADD COLUMN location TEXT;")?;
     }
     Ok(())
 }
@@ -283,14 +287,21 @@ pub struct CachedActivity {
     /// Strava's `start_date` — the true UTC instant the activity began.
     pub start_date: String,
     pub url: String,
+    /// Nearest populated place to the activity's start, as `"City, CC"`.
+    ///
+    /// `None` for activities cached before this column existed, and for
+    /// activities with no GPS trace — indoor, trainer, or manually entered.
+    /// Note it is NOT `None` for activities starting inside a privacy zone;
+    /// see `StravaActivity::start_latlng`.
+    pub location: Option<String>,
 }
 
 pub fn cache_activity(conn: &Connection, activity: &CachedActivity) -> Result<()> {
     conn.execute(
         "INSERT OR REPLACE INTO activity_cache
          (activity_id, athlete_id, title, activity_type, distance_km, duration_s,
-          pace_sec_per_km, start_date_local, start_date, url)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+          pace_sec_per_km, start_date_local, start_date, url, location)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         rusqlite::params![
             activity.activity_id,
             activity.athlete_id,
@@ -302,6 +313,7 @@ pub fn cache_activity(conn: &Connection, activity: &CachedActivity) -> Result<()
             activity.start_date_local,
             activity.start_date,
             activity.url,
+            activity.location,
         ],
     )?;
     Ok(())
@@ -311,8 +323,8 @@ pub fn bulk_cache_activities(conn: &Connection, activities: &[CachedActivity]) -
     let mut stmt = conn.prepare(
         "INSERT OR REPLACE INTO activity_cache
          (activity_id, athlete_id, title, activity_type, distance_km, duration_s,
-          pace_sec_per_km, start_date_local, start_date, url)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+          pace_sec_per_km, start_date_local, start_date, url, location)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
     )?;
     for a in activities {
         stmt.execute(rusqlite::params![
@@ -326,6 +338,7 @@ pub fn bulk_cache_activities(conn: &Connection, activities: &[CachedActivity]) -
             a.start_date_local,
             a.start_date,
             a.url,
+            a.location,
         ])?;
     }
     Ok(())
@@ -462,7 +475,8 @@ pub fn get_oldest_activity_date(conn: &Connection, athlete_id: i64) -> Result<Op
 /// Shared row → `CachedActivity` mapping for `activity_cache` SELECTs.
 ///
 /// Column order must match: `activity_id`, `athlete_id`, `title`, `activity_type`,
-/// `distance_km`, `duration_s`, `pace_sec_per_km`, `start_date_local`, `start_date`, `url`.
+/// `distance_km`, `duration_s`, `pace_sec_per_km`, `start_date_local`, `start_date`,
+/// `url`, `location`.
 fn row_to_cached(row: &rusqlite::Row) -> rusqlite::Result<CachedActivity> {
     Ok(CachedActivity {
         activity_id: row.get(0)?,
@@ -478,6 +492,7 @@ fn row_to_cached(row: &rusqlite::Row) -> rusqlite::Result<CachedActivity> {
         start_date_local: row.get(7)?,
         start_date: row.get::<_, Option<String>>(8)?.unwrap_or_default(),
         url: row.get(9)?,
+        location: row.get(10)?,
     })
 }
 
@@ -505,7 +520,7 @@ pub fn get_recent_activities(
 ) -> Result<Vec<CachedActivity>> {
     let mut stmt = conn.prepare(
         "SELECT activity_id, athlete_id, title, activity_type, distance_km, duration_s,
-                pace_sec_per_km, start_date_local, start_date, url
+                pace_sec_per_km, start_date_local, start_date, url, location
          FROM activity_cache
          WHERE athlete_id = ?1 AND (?2 IS NULL OR activity_id != ?2)
            AND (?4 IS NULL OR start_date_local < ?4)
@@ -596,6 +611,133 @@ mod tests {
         assert!(get_last_activity_utc(&conn, 1).unwrap().is_none());
         // Migration is idempotent.
         migrate_schema(&conn).unwrap();
+    }
+
+    #[test]
+    fn test_migrate_adds_location_to_legacy_cache() {
+        // Simulate a database created before the location column existed.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE activity_cache (
+                activity_id      INTEGER PRIMARY KEY,
+                athlete_id       INTEGER NOT NULL,
+                title            TEXT,
+                activity_type    TEXT,
+                distance_km      REAL,
+                duration_s       INTEGER,
+                pace_sec_per_km  INTEGER,
+                start_date_local TEXT,
+                start_date       TEXT,
+                url              TEXT,
+                cached_at        INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+            INSERT INTO activity_cache
+                (activity_id, athlete_id, title, activity_type, distance_km,
+                 duration_s, pace_sec_per_km, start_date_local, start_date, url)
+            VALUES (1, 1, 'Old Run', 'Run', 5.0, 1500, 300,
+                    '2024-01-01T08:00:00Z', '2024-01-01T00:00:00Z', 'u');",
+        )
+        .unwrap();
+
+        assert!(!column_exists(&conn, "activity_cache", "location").unwrap());
+
+        init_schema(&conn).unwrap();
+        migrate_schema(&conn).unwrap();
+
+        assert!(column_exists(&conn, "activity_cache", "location").unwrap());
+        // The pre-existing row survives the migration with a NULL location.
+        let rows = get_recent_activities(&conn, 1, None, None, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].location, None);
+        // Migration is idempotent.
+        migrate_schema(&conn).unwrap();
+    }
+
+    #[test]
+    fn test_location_round_trips_through_the_cache() {
+        let db = test_db();
+        db.run(|conn| {
+            upsert_athlete(conn, 1, "A", "a", "r", 0)?;
+            cache_activity(
+                conn,
+                &CachedActivity {
+                    activity_id: 10,
+                    athlete_id: 1,
+                    title: "Morning Run".into(),
+                    activity_type: ActivityType::Run,
+                    distance_km: 10.0,
+                    duration_s: 3000,
+                    pace_sec_per_km: Some(300),
+                    start_date_local: "2024-01-02T08:00:00Z".into(),
+                    start_date: "2024-01-02T00:00:00Z".into(),
+                    url: "u".into(),
+                    location: Some("Singapore, SG".into()),
+                },
+            )?;
+
+            let rows = get_recent_activities(conn, 1, None, None, 10)?;
+            assert_eq!(rows[0].location, Some("Singapore, SG".to_string()));
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn test_absent_location_round_trips_as_none() {
+        let db = test_db();
+        db.run(|conn| {
+            upsert_athlete(conn, 1, "A", "a", "r", 0)?;
+            cache_activity(
+                conn,
+                &CachedActivity {
+                    activity_id: 11,
+                    athlete_id: 1,
+                    title: "Treadmill".into(),
+                    activity_type: ActivityType::Run,
+                    distance_km: 5.0,
+                    duration_s: 1500,
+                    pace_sec_per_km: Some(300),
+                    start_date_local: "2024-01-03T08:00:00Z".into(),
+                    start_date: "2024-01-03T00:00:00Z".into(),
+                    url: "u".into(),
+                    location: None,
+                },
+            )?;
+
+            let rows = get_recent_activities(conn, 1, None, None, 10)?;
+            assert_eq!(rows[0].location, None);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn test_bulk_cache_preserves_location() {
+        let db = test_db();
+        db.run(|conn| {
+            upsert_athlete(conn, 1, "A", "a", "r", 0)?;
+            bulk_cache_activities(
+                conn,
+                &[CachedActivity {
+                    activity_id: 12,
+                    athlete_id: 1,
+                    title: "Hill repeats".into(),
+                    activity_type: ActivityType::Run,
+                    distance_km: 8.0,
+                    duration_s: 2400,
+                    pace_sec_per_km: Some(300),
+                    start_date_local: "2024-01-04T08:00:00Z".into(),
+                    start_date: "2024-01-04T00:00:00Z".into(),
+                    url: "u".into(),
+                    location: Some("Kuala Lumpur, MY".into()),
+                }],
+            )?;
+
+            let rows = get_recent_activities(conn, 1, None, None, 10)?;
+            assert_eq!(rows[0].location, Some("Kuala Lumpur, MY".to_string()));
+            Ok(())
+        })
+        .unwrap();
     }
 
     #[test]
@@ -777,6 +919,7 @@ mod tests {
                 start_date_local: "2024-01-15T08:30:00Z".into(),
                 start_date: "2024-01-15T08:30:00Z".into(),
                 url: "https://strava.com/activities/200".into(),
+                location: None,
             };
             cache_activity(conn, &act).unwrap();
 
@@ -812,6 +955,7 @@ mod tests {
                     start_date_local: date1.into(),
                     start_date: String::new(),
                     url: String::new(),
+                    location: None,
                 },
             )
             .unwrap();
@@ -828,6 +972,7 @@ mod tests {
                     start_date_local: date2.into(),
                     start_date: String::new(),
                     url: String::new(),
+                    location: None,
                 },
             )
             .unwrap();
@@ -875,6 +1020,7 @@ mod tests {
                         start_date_local: date.into(),
                         start_date: date.into(),
                         url: "u".into(),
+                        location: None,
                     },
                 )?;
             }
@@ -909,6 +1055,7 @@ mod tests {
                 start_date_local: format!("{}T08:00:00Z", date),
                 start_date: format!("{}T08:00:00Z", date),
                 url: "u".into(),
+                location: None,
             },
         )
     }
@@ -1038,6 +1185,7 @@ mod tests {
                     start_date_local: "2026-05-10T23:00:00".into(), // Sunday
                     start_date: String::new(),
                     url: String::new(),
+                    location: None,
                 },
             )
             .unwrap();
@@ -1074,6 +1222,7 @@ mod tests {
                     start_date_local: "2026-05-11T00:01:00".into(), // Monday
                     start_date: String::new(),
                     url: String::new(),
+                    location: None,
                 },
             )
             .unwrap();
@@ -1110,6 +1259,7 @@ mod tests {
                     start_date_local: "2026-05-31T22:00:00".into(),
                     start_date: String::new(),
                     url: String::new(),
+                    location: None,
                 },
             )
             .unwrap();
@@ -1126,6 +1276,7 @@ mod tests {
                     start_date_local: "2026-06-01T06:00:00".into(),
                     start_date: String::new(),
                     url: String::new(),
+                    location: None,
                 },
             )
             .unwrap();
@@ -1168,6 +1319,7 @@ mod tests {
                         start_date_local: time_str.into(),
                         start_date: String::new(),
                         url: String::new(),
+                        location: None,
                     },
                 )
                 .unwrap();
@@ -1191,6 +1343,7 @@ mod tests {
                     start_date_local: "2026-05-10T23:59:00".into(),
                     start_date: String::new(),
                     url: String::new(),
+                    location: None,
                 },
             )
             .unwrap();
@@ -1224,6 +1377,7 @@ mod tests {
                     start_date_local: "2024-01-01T00:00:00Z".into(),
                     start_date: "2024-01-01T00:00:00Z".into(),
                     url: String::new(),
+                    location: None,
                 },
             )
             .unwrap();
@@ -1240,6 +1394,7 @@ mod tests {
                     start_date_local: "2024-01-15T00:00:00Z".into(),
                     start_date: "2024-01-15T00:00:00Z".into(),
                     url: String::new(),
+                    location: None,
                 },
             )
             .unwrap();
@@ -1279,6 +1434,7 @@ mod tests {
                     start_date_local: "2026-06-14T07:59:51Z".into(), // AEST wall clock
                     start_date: "2026-06-13T21:59:51Z".into(),       // true UTC, 10h earlier
                     url: String::new(),
+                    location: None,
                 },
             )
             .unwrap();
@@ -1311,6 +1467,7 @@ mod tests {
                     start_date_local: "2024-01-01T08:00:00Z".into(),
                     start_date: String::new(),
                     url: String::new(),
+                    location: None,
                 },
             )
             .unwrap();
@@ -1341,6 +1498,7 @@ mod tests {
                     start_date_local: "2024-01-01T08:00:00Z".into(),
                     start_date: String::new(),
                     url: String::new(),
+                    location: None,
                 },
             )
             .unwrap();
@@ -1374,6 +1532,7 @@ mod tests {
                         start_date_local: today.clone(),
                         start_date: today.clone(),
                         url: String::new(),
+                        location: None,
                     },
                     CachedActivity {
                         activity_id: 2,
@@ -1386,6 +1545,7 @@ mod tests {
                         start_date_local: today.clone(),
                         start_date: today.clone(),
                         url: String::new(),
+                        location: None,
                     },
                 ],
             )
@@ -1418,6 +1578,7 @@ mod tests {
                         start_date_local: format!("2026-08-{}T08:00:00Z", day),
                         start_date: format!("2026-08-{}T08:00:00Z", day),
                         url: "u".into(),
+                        location: None,
                     },
                 )?;
             }
@@ -1465,6 +1626,7 @@ mod tests {
                         start_date_local: format!("2026-08-{}T08:00:00Z", day),
                         start_date: format!("2026-08-{}T08:00:00Z", day),
                         url: "u".into(),
+                        location: None,
                     },
                 )?;
             }
@@ -1500,6 +1662,7 @@ mod tests {
                         start_date_local: format!("2026-08-{}T08:00:00Z", day),
                         start_date: format!("2026-08-{}T08:00:00Z", day),
                         url: "u".into(),
+                        location: None,
                     },
                 )?;
             }
