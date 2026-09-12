@@ -1139,7 +1139,7 @@ mod tests {
 
     #[test]
     fn test_activity_without_location_omits_the_near_line() {
-        // Privacy zone or indoor activity: say nothing rather than guess.
+        // Indoor or manual activity, so no GPS: say nothing rather than guess.
         let msg = build_user_message("Zack", &act(99, "16", 12.4, Some(312)), None, &[], &vol());
 
         assert!(!msg.contains("near "), "msg was: {}", msg);

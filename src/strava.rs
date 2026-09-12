@@ -36,8 +36,13 @@ pub struct StravaActivity {
     pub elapsed_time: i64,
     pub start_date: String,
     pub start_date_local: String,
-    /// `(lat, lng)` of the activity's start, or `None` when Strava withholds
-    /// it — privacy zone, hidden start, or an indoor/manual entry.
+    /// `(lat, lng)` of the activity's start, or `None` when the activity has
+    /// no GPS trace at all — indoor, trainer, or manually entered.
+    ///
+    /// Note this is the athlete's *true* start point, not a privacy-trimmed
+    /// one: the bot authorizes with `activity:read_all`, and that scope
+    /// returns data inside the athlete's privacy zones. Privacy zones only
+    /// trim what other people see.
     #[serde(default, deserialize_with = "deserialize_latlng")]
     pub start_latlng: Option<(f64, f64)>,
 }

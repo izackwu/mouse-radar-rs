@@ -6,6 +6,12 @@
 //! network hop, another rate limit, another thing that times out — we resolve
 //! coordinates against the `GeoNames` `cities1000` dataset bundled into the
 //! binary by `reverse_geocoder`.
+//!
+//! The input is the athlete's true start point — privacy zones do not trim
+//! what `activity:read_all` returns (see `StravaActivity::start_latlng`) — so
+//! the coarseness here is the only thing standing between a home address and
+//! the group chat. Nearest-populated-place is deliberate: it resolves a
+//! doorstep to a town name, never to coordinates.
 
 use std::sync::OnceLock;
 

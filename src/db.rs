@@ -290,8 +290,9 @@ pub struct CachedActivity {
     /// Nearest populated place to the activity's start, as `"City, CC"`.
     ///
     /// `None` for activities cached before this column existed, and for
-    /// activities Strava gives no usable start point for — privacy zones,
-    /// hidden starts, indoor and manual entries.
+    /// activities with no GPS trace — indoor, trainer, or manually entered.
+    /// Note it is NOT `None` for activities starting inside a privacy zone;
+    /// see `StravaActivity::start_latlng`.
     pub location: Option<String>,
 }
 
