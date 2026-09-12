@@ -378,6 +378,7 @@ mod tests {
             elapsed_time: 300,
             start_date: start_date.into(),
             start_date_local: start_date.into(),
+            start_latlng: None,
         }
     }
 

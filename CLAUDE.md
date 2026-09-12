@@ -28,6 +28,8 @@ src/
 ├── commands.rs    # teloxide Command enum (typed args) + handlers (/register /auth
 │                  # /strava /latest …); malformed commands get a usage-hint reply
 ├── formatting.rs  # pace, duration, distance formatters shared by message text + card
+├── geo.rs         # offline reverse geocoding: start_latlng → "City, CC", resolved
+│                  # against the GeoNames cities1000 dataset bundled in the binary
 ├── types.rs       # ActivityType enum (Run / TrailRun / Ride / Hike / Walk / Swim / Other)
 └── card.rs        # SVG → PNG card renderer. The trickiest file in the repo — see below
 ```
@@ -74,6 +76,15 @@ CI (`.github/workflows/ci.yml`) runs fmt + clippy + test on every PR.
 ## Things to be careful about
 
 - **Don't drop `font-noto-cjk` / `font-noto-emoji` from the Dockerfile** — the Linux build will silently regress to tofu boxes for everything past Latin-1 (see [docs/card-rendering.md](docs/card-rendering.md)).
+- **Strava's `location_city` / `location_state` / `location_country` are dead** — deprecated
+  in 2016, they come back null. Activity location comes from reverse-geocoding
+  `start_latlng` offline in `geo.rs`; it is `None` whenever Strava withholds the start
+  point (privacy zone, hidden start, indoor or manual entry). Two sources feed it:
+  the poller resolves it in `strava::to_cached` and persists it, and `compose_comment`
+  fills a NULL from the detail response's `start_latlng` for the prompt only — that
+  request is already paid for, but the result is deliberately not written back, to keep
+  the detached comment task read-only against `activity_cache`. Consequence: history
+  rows in the prompt stay `—` until the poller caches them fresh; there is no backfill.
 - **Strava's `start_date_local` is mislabeled with a `Z` suffix** — it's local time wearing a UTC costume. Use `start_date` (true UTC) for any cutoff/epoch math; deriving cutoffs from `start_date_local` jumps hours into the future in positive-offset zones and drops same-day activities (see the fix in #14).
 - **Don't add a CLAUDE.md, README.md, or other doc file unsolicited** — only when the user asks. Same for `// removed X` comments and re-exports for backwards compat.
 - **The `card-snapshots/` and `card-snapshots-linux/` directories are gitignored**. Don't commit them. They're regenerated locally.

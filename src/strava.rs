@@ -1,6 +1,6 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use std::time::Duration;
 
 use crate::db::CachedActivity;
@@ -36,6 +36,26 @@ pub struct StravaActivity {
     pub elapsed_time: i64,
     pub start_date: String,
     pub start_date_local: String,
+    /// `(lat, lng)` of the activity's start, or `None` when Strava withholds
+    /// it — privacy zone, hidden start, or an indoor/manual entry.
+    #[serde(default, deserialize_with = "deserialize_latlng")]
+    pub start_latlng: Option<(f64, f64)>,
+}
+
+/// Parse Strava's `start_latlng`, which arrives as `[lat, lng]`, `[]`, or
+/// `null` depending on whether the athlete exposes the start point.
+///
+/// Everything that is not a usable pair collapses to `None` here, at the wire
+/// boundary, so no downstream code has to re-check the arity.
+fn deserialize_latlng<'de, D>(deserializer: D) -> Result<Option<(f64, f64)>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = Option::<Vec<f64>>::deserialize(deserializer)?;
+    Ok(match raw.as_deref() {
+        Some(&[lat, lon]) => Some((lat, lon)),
+        _ => None,
+    })
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -64,6 +84,11 @@ pub struct StravaActivityDetail {
     pub laps: Vec<StravaLap>,
     #[serde(default)]
     pub best_efforts: Vec<StravaBestEffort>,
+    /// Same start point as the summary activity carries. Kept here so the
+    /// comment path can resolve a location for an activity cached before the
+    /// `location` column existed, without spending an extra request.
+    #[serde(default, deserialize_with = "deserialize_latlng")]
+    pub start_latlng: Option<(f64, f64)>,
 }
 
 /// One of Strava's uniform per-kilometre splits.
@@ -281,6 +306,9 @@ pub fn to_cached(activity: &StravaActivity) -> CachedActivity {
         start_date_local: activity.start_date_local.clone(),
         start_date: activity.start_date.clone(),
         url: format!("https://www.strava.com/activities/{}", activity.id),
+        location: activity
+            .start_latlng
+            .and_then(|(lat, lon)| crate::geo::lookup(lat, lon)),
     }
 }
 
@@ -303,6 +331,7 @@ mod tests {
             elapsed_time: 3100,
             start_date: "2024-01-01T00:00:00Z".into(),
             start_date_local: "2024-01-01T08:00:00Z".into(),
+            start_latlng: None,
         };
 
         let cached = to_cached(&act);
@@ -327,10 +356,93 @@ mod tests {
             elapsed_time: 600,
             start_date: "2024-01-01T00:00:00Z".into(),
             start_date_local: "2024-01-01T00:00:00Z".into(),
+            start_latlng: None,
         };
 
         let cached = to_cached(&act);
         assert_eq!(cached.pace_sec_per_km, None);
+    }
+
+    #[test]
+    fn test_to_cached_resolves_location_from_start_latlng() {
+        let act = StravaActivity {
+            id: 1,
+            athlete: StravaAthleteSummary { id: 1 },
+            name: "Run".into(),
+            activity_type: ActivityType::Run,
+            distance: 10000.0,
+            moving_time: 3000,
+            elapsed_time: 3000,
+            start_date: "2024-01-01T00:00:00Z".into(),
+            start_date_local: "2024-01-01T08:00:00Z".into(),
+            start_latlng: Some((1.3138, 103.8159)),
+        };
+
+        assert_eq!(to_cached(&act).location, Some("Singapore, SG".to_string()));
+    }
+
+    #[test]
+    fn test_to_cached_leaves_location_none_when_start_is_hidden() {
+        let act = StravaActivity {
+            id: 1,
+            athlete: StravaAthleteSummary { id: 1 },
+            name: "Run".into(),
+            activity_type: ActivityType::Run,
+            distance: 10000.0,
+            moving_time: 3000,
+            elapsed_time: 3000,
+            start_date: "2024-01-01T00:00:00Z".into(),
+            start_date_local: "2024-01-01T08:00:00Z".into(),
+            start_latlng: None,
+        };
+
+        assert_eq!(to_cached(&act).location, None);
+    }
+
+    #[test]
+    fn test_activity_deserializes_without_start_latlng() {
+        // Strava omits the key entirely for some activities; serde must not
+        // fail the whole parse over it.
+        let json = r#"{
+            "id": 1, "athlete": {"id": 2}, "name": "Run", "type": "Run",
+            "distance": 1000.0, "moving_time": 300, "elapsed_time": 300,
+            "start_date": "2024-01-01T00:00:00Z",
+            "start_date_local": "2024-01-01T08:00:00Z"
+        }"#;
+
+        let act: StravaActivity = serde_json::from_str(json).unwrap();
+        assert_eq!(act.start_latlng, None);
+    }
+
+    #[test]
+    fn test_activity_deserializes_malformed_start_latlng_as_none() {
+        // Anything that is not a usable pair collapses at the wire boundary,
+        // so no downstream code has to re-check the arity.
+        let json = r#"{
+            "id": 1, "athlete": {"id": 2}, "name": "Run", "type": "Run",
+            "distance": 1000.0, "moving_time": 300, "elapsed_time": 300,
+            "start_date": "2024-01-01T00:00:00Z",
+            "start_date_local": "2024-01-01T08:00:00Z",
+            "start_latlng": [1.3138]
+        }"#;
+
+        let act: StravaActivity = serde_json::from_str(json).unwrap();
+        assert_eq!(act.start_latlng, None);
+    }
+
+    #[test]
+    fn test_activity_deserializes_empty_start_latlng_as_no_location() {
+        // Indoor and manual activities come back with an empty array.
+        let json = r#"{
+            "id": 1, "athlete": {"id": 2}, "name": "Treadmill", "type": "Run",
+            "distance": 1000.0, "moving_time": 300, "elapsed_time": 300,
+            "start_date": "2024-01-01T00:00:00Z",
+            "start_date_local": "2024-01-01T08:00:00Z",
+            "start_latlng": []
+        }"#;
+
+        let act: StravaActivity = serde_json::from_str(json).unwrap();
+        assert_eq!(to_cached(&act).location, None);
     }
 
     #[test]
@@ -354,9 +466,11 @@ mod tests {
             "best_efforts": [
                 {"name": "5k", "elapsed_time": 1264, "pr_rank": 2},
                 {"name": "1k", "elapsed_time": 240, "pr_rank": null}
-            ]
+            ],
+            "start_latlng": [1.3138, 103.8159]
         }"#;
         let d: StravaActivityDetail = serde_json::from_str(body).unwrap();
+        assert_eq!(d.start_latlng, Some((1.3138, 103.8159)));
         assert_eq!(d.max_heartrate, Some(171.0));
         assert_eq!(d.splits_metric.len(), 1);
         assert_eq!(d.splits_metric[0].average_heartrate, Some(141.0));

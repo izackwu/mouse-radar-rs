@@ -19,6 +19,8 @@ struct MockStrava {
     /// "Strava detail fetch fails → degrade to summary + history prompt,
     /// still comment" path.
     fail_detail: bool,
+    /// Start point returned on the detail response.
+    detail_latlng: Option<(f64, f64)>,
 }
 
 #[async_trait]
@@ -49,7 +51,10 @@ impl StravaApi for MockStrava {
         if self.fail_detail {
             anyhow::bail!("stub detail fetch failure");
         }
-        Ok(mouse_radar_rs::strava::StravaActivityDetail::default())
+        Ok(mouse_radar_rs::strava::StravaActivityDetail {
+            start_latlng: self.detail_latlng,
+            ..Default::default()
+        })
     }
 }
 
@@ -76,6 +81,7 @@ async fn test_full_pipeline_with_mock() {
             elapsed_time: 1600,
             start_date: "2026-05-14T08:00:00Z".into(),
             start_date_local: "2026-05-14T16:00:00Z".into(),
+            start_latlng: Some((1.3138, 103.8159)),
         }],
         token_response: Some(TokenResponse {
             access_token: "acc".into(),
@@ -84,6 +90,7 @@ async fn test_full_pipeline_with_mock() {
             expires_in: 21600,
         }),
         fail_detail: false,
+        detail_latlng: None,
     });
 
     let strava_client: Arc<dyn StravaApi> = mock;
@@ -103,9 +110,17 @@ async fn test_full_pipeline_with_mock() {
     assert_eq!(cached.distance_km, 5.0);
     assert_eq!(cached.title, "Morning Run");
     assert_eq!(cached.url, "https://www.strava.com/activities/999");
+    assert_eq!(cached.location, Some("Singapore, SG".to_string()));
 
     // Cache it in the DB
     db.run(|conn| db::cache_activity(conn, &cached)).unwrap();
+
+    // The location survives the round trip through SQLite.
+    let stored = db
+        .run(|conn| db::get_latest_activity(conn, 12345))
+        .unwrap()
+        .expect("cached activity");
+    assert_eq!(stored.location, Some("Singapore, SG".to_string()));
 
     // Verify stats (activity date is 2026-05-14)
     let monday = chrono::NaiveDate::from_ymd_opt(2026, 5, 11).unwrap();
@@ -161,6 +176,7 @@ fn test_cache_survives_reopen() {
                     start_date_local: "2026-05-14T08:00:00Z".into(),
                     start_date: "2026-05-14T08:00:00Z".into(),
                     url: "https://strava.com/activities/1".into(),
+                    location: None,
                 },
             )
         })
@@ -232,6 +248,7 @@ fn seed_db_with_history(db: &Arc<Db>, count: i64) -> CachedActivity {
                     start_date_local: format!("2026-08-{:02}T08:00:00Z", i + 1),
                     start_date: format!("2026-08-{:02}T08:00:00Z", i + 1),
                     url: "u".into(),
+                    location: None,
                 },
             )
         })
@@ -249,6 +266,7 @@ fn seed_db_with_history(db: &Arc<Db>, count: i64) -> CachedActivity {
         start_date_local: "2026-08-16T06:28:00Z".into(),
         start_date: "2026-08-16T06:28:00Z".into(),
         url: "u".into(),
+        location: None,
     };
     // The poller caches before notifying, so the current activity is present.
     db.run(|conn| db::cache_activity(conn, &current)).unwrap();
@@ -269,6 +287,7 @@ async fn test_compose_comment_returns_text() {
         activities: vec![],
         token_response: None,
         fail_detail: false,
+        detail_latlng: None,
     });
 
     let got = comment::compose_comment(
@@ -296,6 +315,88 @@ async fn test_compose_comment_returns_text() {
 }
 
 #[tokio::test]
+async fn test_compose_comment_fills_a_missing_location_from_the_detail() {
+    // Activities cached before the location column existed have none. The
+    // detail response already carries start_latlng and that request is already
+    // paid for, so the prompt should not go without a location.
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(Db::open(dir.path().join("t.db").to_str().unwrap()).unwrap());
+    let current = seed_db_with_history(&db, 5);
+    assert_eq!(current.location, None, "fixture should start without one");
+
+    let ai: Arc<dyn AiClient> = Arc::new(StubAi {
+        response: "Nice one.".into(),
+        fail: false,
+    });
+    let strava: Arc<dyn StravaApi> = Arc::new(MockStrava {
+        activities: vec![],
+        token_response: None,
+        fail_detail: false,
+        detail_latlng: Some((1.3138, 103.8159)),
+    });
+
+    let got = comment::compose_comment(
+        &ai,
+        &strava,
+        &db,
+        &test_ai_config(),
+        "acc",
+        "zack",
+        &current,
+    )
+    .await
+    .unwrap();
+
+    let prompt = got.prompt.expect("prompt returned");
+    assert!(
+        prompt.contains("near Singapore, SG"),
+        "prompt was:\n{}",
+        prompt
+    );
+}
+
+#[tokio::test]
+async fn test_compose_comment_prefers_the_cached_location_over_the_detail() {
+    // The cached value came from the same source and is already resolved;
+    // the detail must not override it.
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(Db::open(dir.path().join("t.db").to_str().unwrap()).unwrap());
+    let mut current = seed_db_with_history(&db, 5);
+    current.location = Some("Kuala Lumpur, MY".into());
+
+    let ai: Arc<dyn AiClient> = Arc::new(StubAi {
+        response: "Nice one.".into(),
+        fail: false,
+    });
+    let strava: Arc<dyn StravaApi> = Arc::new(MockStrava {
+        activities: vec![],
+        token_response: None,
+        fail_detail: false,
+        detail_latlng: Some((1.3138, 103.8159)),
+    });
+
+    let got = comment::compose_comment(
+        &ai,
+        &strava,
+        &db,
+        &test_ai_config(),
+        "acc",
+        "zack",
+        &current,
+    )
+    .await
+    .unwrap();
+
+    let prompt = got.prompt.expect("prompt returned");
+    assert!(
+        prompt.contains("near Kuala Lumpur, MY"),
+        "prompt was:\n{}",
+        prompt
+    );
+    assert!(!prompt.contains("Singapore"), "prompt was:\n{}", prompt);
+}
+
+#[tokio::test]
 async fn test_compose_comment_skips_when_no_history() {
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(Db::open(dir.path().join("t.db").to_str().unwrap()).unwrap());
@@ -310,6 +411,7 @@ async fn test_compose_comment_skips_when_no_history() {
         activities: vec![],
         token_response: None,
         fail_detail: false,
+        detail_latlng: None,
     });
 
     let got = comment::compose_comment(
@@ -343,6 +445,7 @@ async fn test_compose_comment_propagates_ai_failure() {
         activities: vec![],
         token_response: None,
         fail_detail: false,
+        detail_latlng: None,
     });
 
     let got = comment::compose_comment(
@@ -374,6 +477,7 @@ async fn test_compose_comment_skips_blank_completion() {
         activities: vec![],
         token_response: None,
         fail_detail: false,
+        detail_latlng: None,
     });
 
     let got = comment::compose_comment(
@@ -411,6 +515,7 @@ async fn test_compose_comment_degrades_when_strava_detail_fetch_fails() {
         activities: vec![],
         token_response: None,
         fail_detail: true,
+        detail_latlng: None,
     });
 
     let got = comment::compose_comment(

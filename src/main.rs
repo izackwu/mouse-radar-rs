@@ -5,6 +5,7 @@ pub mod comment;
 pub mod config;
 pub mod db;
 pub mod formatting;
+pub mod geo;
 pub mod poller;
 pub mod strava;
 pub mod types;
